@@ -33,6 +33,7 @@ import {
   type InlineRefInput,
   insertInlineRefsIntoEditor
 } from '@/app/chat/composer/inline-refs'
+import { ComposerDirectiveActions } from '@/app/chat/composer/directive-actions'
 import { chipTypedPathOnSpace, pathifyRefs } from '@/app/chat/composer/path-refs'
 import {
   COMPOSER_PLACEHOLDER_CLASS,
@@ -795,6 +796,7 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
               spellCheck={false}
               suppressContentEditableWarning
             />
+            <ComposerDirectiveActions editorRef={editorRef} />
             <ComposerPrimitive.Input
               asChild
               className="sr-only"
