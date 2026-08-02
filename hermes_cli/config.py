@@ -1910,6 +1910,15 @@ DEFAULT_CONFIG = {
         # multi-tool agent turn. Bridged to HERMES_MEDIA_TRUST_RECENT_SECONDS.
         # Only consulted when ``strict`` is true.
         "trust_recent_files_seconds": 600,
+        # Typing/presence indicators while a gateway turn is active.
+        # Platform adapters refresh these until the turn completes by default.
+        # Set enabled=false to disable globally, or max_seconds=N to show the
+        # indicator only for the first N seconds of a long turn. Per-platform
+        # overrides can also be set under display.platforms.<platform>.typing.
+        "typing": {
+            "enabled": True,
+            "max_seconds": 0,
+        },
     },
 
     # Session storage — controls automatic cleanup of ~/.hermes/state.db.

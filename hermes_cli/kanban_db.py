@@ -2420,41 +2420,33 @@ def _synthesize_ended_run(
 # ---------------------------------------------------------------------------
 
 def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Return True when ``task_id`` is sticky-blocked by an explicit
-    worker/operator ``kanban_block`` call (#28712).
+    """Return True when ``task_id`` must stay blocked until intervention.
 
-    A ``blocked`` status can come from two very different sources:
+    A ``blocked`` status can come from two human-visible sources:
 
     * **Worker- or operator-initiated** — a worker called
       ``kanban_block(reason="review-required: ...")`` (or somebody ran
-      ``hermes kanban block <id>``).  This is a deliberate handoff that
-      should stay blocked until an operator unblocks it.  The block tool
-      emits a ``"blocked"`` event row in ``task_events``.
+      ``hermes kanban block <id>``). This deliberate handoff emits a
+      ``"blocked"`` event and must stay blocked until an operator
+      unblocks it.
 
     * **Circuit-breaker** — ``_record_task_failure`` tripped after
-      repeated crashes / spawn failures / timeouts.  This emits
-      ``"gave_up"``, *not* ``"blocked"``, and is meant to recover
-      automatically once the underlying conditions change (e.g. parents
-      finish, transient infra error clears).
+      repeated crashes / spawn failures / timeouts. This emits
+      ``"gave_up"``. It must also stay blocked; otherwise parent-free
+      tasks are auto-promoted by ``recompute_ready`` on the next
+      dispatcher tick and immediately respawn into the same crash loop.
 
-    The cheapest signal that distinguishes the two is the most recent
-    ``"blocked"`` / ``"unblocked"`` event for the task.  If the most
-    recent one is ``"blocked"`` (or there is a ``"blocked"`` event and
-    no ``"unblocked"`` event has fired since), the task is sticky and
-    ``recompute_ready`` must *not* auto-promote it.
-
-    Returns ``False`` when there is no such event at all (e.g. the task
-    was set to ``status='blocked'`` by the circuit breaker or by direct
-    DB manipulation) — preserves the pre-#28712 auto-recover semantics
-    for that path.
+    The latest recovery/intervention event wins. ``unblocked`` exits a
+    deliberate block, and ``assigned`` represents an operator re-routing
+    the task/profile so the next dispatch gets a fresh chance.
     """
     row = conn.execute(
         "SELECT kind FROM task_events "
-        "WHERE task_id = ? AND kind IN ('blocked', 'unblocked') "
+        "WHERE task_id = ? AND kind IN ('blocked', 'gave_up', 'unblocked', 'assigned') "
         "ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
-    return bool(row) and row["kind"] == "blocked"
+    return bool(row) and row["kind"] in {"blocked", "gave_up"}
 
 
 def recompute_ready(conn: sqlite3.Connection) -> int:
@@ -2465,12 +2457,12 @@ def recompute_ready(conn: sqlite3.Connection) -> int:
 
     ``blocked`` tasks are also considered for promotion (so a task
     blocked purely by a parent dependency unblocks itself when the
-    parent completes), *except* when the most recent block event was a
-    worker-initiated ``kanban_block`` — those stay blocked until an
-    explicit ``kanban_unblock`` (#28712).  Without that guard, a
-    ``review-required`` handoff would auto-respawn, the fresh worker
-    would find nothing to do, exit cleanly, get recorded as a protocol
-    violation, and the cycle would repeat indefinitely.
+    parent completes), *except* when the latest relevant event is a
+    worker/operator ``blocked`` or circuit-breaker ``gave_up`` event —
+    those stay blocked until an explicit recovery event such as
+    ``unblocked`` or ``assigned`` (#28712). Without that guard, a
+    ``review-required`` handoff or crash-loop breaker trip would
+    auto-respawn and loop indefinitely.
     """
     promoted = 0
     with write_txn(conn):
@@ -4630,6 +4622,7 @@ def enforce_max_runtime(
     conn: sqlite3.Connection,
     *,
     signal_fn=None,
+    failure_limit: Optional[int] = None,
 ) -> list[str]:
     """Terminate workers whose per-task ``max_runtime_seconds`` has elapsed.
 
@@ -4732,6 +4725,7 @@ def enforce_max_runtime(
                 conn, tid,
                 error=f"elapsed {int(elapsed)}s > limit {int(row['max_runtime_seconds'])}s",
                 outcome="timed_out",
+                failure_limit=failure_limit,
                 release_claim=False,
                 end_run=False,
                 event_payload_extra={"pid": pid, "sigkill": killed},
@@ -4876,7 +4870,11 @@ def _error_fingerprint(error_text: str) -> str:
     return fp.lower().strip()
 
 
-def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
+def detect_crashed_workers(
+    conn: sqlite3.Connection,
+    *,
+    failure_limit: Optional[int] = None,
+) -> list[str]:
     """Reclaim ``running`` tasks whose worker PID is no longer alive.
 
     Appends a ``crashed`` event and drops the task back to ``ready``.
@@ -5007,7 +5005,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 conn, tid,
                 error=error_text,
                 outcome="crashed",
-                failure_limit=1 if (protocol_violation or is_systemic) else None,
+                failure_limit=1 if (protocol_violation or is_systemic) else failure_limit,
                 release_claim=False,
                 end_run=False,
                 event_payload_extra={"pid": pid, "claimer": claimer},
@@ -5028,7 +5026,7 @@ def _record_task_failure(
     error: str,
     *,
     outcome: str,
-    failure_limit: int = None,
+    failure_limit: Optional[int] = None,
     release_claim: bool = False,
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
@@ -5183,7 +5181,7 @@ def _record_spawn_failure(
     task_id: str,
     error: str,
     *,
-    failure_limit: int = None,
+    failure_limit: Optional[int] = None,
 ) -> bool:
     return _record_task_failure(
         conn, task_id, error,
@@ -5414,7 +5412,7 @@ def dispatch_once(
     result.stale = detect_stale_running(
         conn, stale_timeout_seconds=stale_timeout_seconds,
     )
-    result.crashed = detect_crashed_workers(conn)
+    result.crashed = detect_crashed_workers(conn, failure_limit=failure_limit)
     # detect_crashed_workers stashes protocol-violation auto-blocks on
     # itself so the public list-return stays stable. Pull them into the
     # DispatchResult here so telemetry / tests see the trip.
@@ -5423,7 +5421,7 @@ def dispatch_once(
     )
     if _crash_auto_blocked:
         result.auto_blocked.extend(_crash_auto_blocked)
-    result.timed_out = enforce_max_runtime(conn)
+    result.timed_out = enforce_max_runtime(conn, failure_limit=failure_limit)
     result.promoted = recompute_ready(conn)
 
     # Count tasks already running so max_spawn enforces concurrency rather

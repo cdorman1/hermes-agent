@@ -604,6 +604,84 @@ def test_detect_crashed_workers_isolated_failure_normal_retry(
             )
 
 
+def test_detect_crashed_workers_honors_failure_limit_override(
+    kanban_home, monkeypatch,
+):
+    """Crash-loop breaker should use dispatcher failure_limit, not a spawn-only default."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="crashy", assignee="a")
+
+        for attempt in range(1, 4):
+            claimed = kb.claim_task(conn, tid, claimer=f"{host}:w{attempt}")
+            assert claimed is not None
+            kb._set_worker_pid(conn, tid, 81000 + attempt)
+
+            crashed = kb.detect_crashed_workers(conn, failure_limit=3)
+            assert crashed == [tid]
+            task = kb.get_task(conn, tid)
+            assert task.consecutive_failures == attempt
+            if attempt < 3:
+                assert task.status == "ready"
+            else:
+                assert task.status == "blocked"
+                promoted = kb.recompute_ready(conn)
+                assert promoted == 0
+                assert kb.get_task(conn, tid).status == "blocked"
+
+
+def test_dispatch_passes_failure_limit_to_crash_detector(
+    kanban_home, monkeypatch,
+):
+    """dispatch_once(failure_limit=N) must govern worker crashes as well as spawn failures."""
+    import hermes_cli.kanban_db as _kb
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    next_pid = 82000
+
+    def spawn(task, workspace, board=None):
+        nonlocal next_pid
+        next_pid += 1
+        return next_pid
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="dispatch crash", assignee="a")
+
+        first = kb.dispatch_once(conn, spawn_fn=spawn, failure_limit=3)
+        assert first.spawned and first.spawned[0][0] == tid
+
+        second = kb.dispatch_once(conn, spawn_fn=spawn, failure_limit=3)
+        assert second.crashed == [tid]
+        assert kb.get_task(conn, tid).status == "running"
+        assert kb.get_task(conn, tid).consecutive_failures == 1
+
+        third = kb.dispatch_once(conn, spawn_fn=spawn, failure_limit=3)
+        assert third.crashed == [tid]
+        task = kb.get_task(conn, tid)
+        assert task.consecutive_failures == 2
+        assert task.status == "running", "should not block until third crash when failure_limit=3"
+
+        fourth = kb.dispatch_once(conn, spawn_fn=spawn, failure_limit=3)
+        assert fourth.crashed == [tid]
+        assert tid in fourth.auto_blocked
+        task = kb.get_task(conn, tid)
+        assert task.consecutive_failures == 3
+        assert task.status == "blocked"
+
+        fifth = kb.dispatch_once(conn, spawn_fn=spawn, failure_limit=3)
+        assert fifth.spawned == []
+        assert kb.get_task(conn, tid).status == "blocked"
+
+
 def test_detect_crashed_workers_skips_freshly_claimed_tasks(
     kanban_home, monkeypatch,
 ):

@@ -492,6 +492,217 @@ class TelegramAdapter(BasePlatformAdapter):
         # same key edit the same message instead of appending new ones (#30045).
         self._status_message_ids: Dict[tuple, str] = {}
 
+    @staticmethod
+    def _telegram_user_display(user: Any) -> str:
+        first = getattr(user, "first_name", None) or ""
+        last = getattr(user, "last_name", None) or ""
+        display = " ".join(part for part in [first, last] if part).strip()
+        return display or getattr(user, "username", None) or str(getattr(user, "id", "Coach"))
+
+    async def _handle_coach_checklist_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+        """Handle KMFS coach checklist slash commands.
+
+        Returns True when the update was consumed and should not be forwarded to
+        the LLM command path.
+        """
+        msg = self._effective_update_message(update)
+        if not msg or not msg.text:
+            return False
+        command = (msg.text.split(maxsplit=1)[0] or "").split("@", 1)[0].lower()
+        if command not in {"/coachchecklist", "/coachchecklists", "/coachchecklistexport"}:
+            return False
+
+        try:
+            from gateway import coach_checklist as cc
+        except Exception as exc:
+            logger.error("[%s] Coach checklist module unavailable: %s", self.name, exc, exc_info=True)
+            await msg.reply_text("Coach checklist is temporarily unavailable.")
+            return True
+
+        chat_id = getattr(msg, "chat_id", None)
+        thread_id = getattr(msg, "message_thread_id", None)
+        if chat_id is None:
+            await msg.reply_text("Coach checklist cannot determine this chat ID.")
+            return True
+        if not cc.chat_allowed(chat_id, self.config.extra):
+            logger.warning("[%s] Unauthorized coach checklist command in chat=%s", self.name, chat_id)
+            await msg.reply_text("⛔ Coach checklist is not authorized in this Telegram chat.")
+            return True
+
+        if command == "/coachchecklist":
+            if not getattr(msg, "from_user", None):
+                await msg.reply_text("Coach checklist requires a Telegram user identity. Please run it from a group/supergroup message, not an anonymous channel post.")
+                return True
+            session = cc.create_session(
+                msg.from_user,
+                int(chat_id),
+                thread_id=int(thread_id) if thread_id is not None else None,
+                message_id=getattr(msg, "message_id", None),
+            )
+            await msg.reply_text(cc.render_trial_prompt(session))
+            return True
+
+        if command == "/coachchecklists":
+            arg = msg.text.split(maxsplit=1)[1] if len(msg.text.split(maxsplit=1)) > 1 else None
+            try:
+                text = await asyncio.to_thread(cc.recent_submissions_text, arg)
+            except Exception as exc:
+                logger.error("[%s] Coach checklist query failed: %s", self.name, exc, exc_info=True)
+                text = "Coach checklist query failed. Check gateway logs."
+            await msg.reply_text(text)
+            return True
+
+        if command == "/coachchecklistexport":
+            try:
+                export_path = await asyncio.to_thread(cc.export_csv)
+                with open(export_path, "rb") as handle:
+                    await context.bot.send_document(
+                        chat_id=chat_id,
+                        document=handle,
+                        filename=export_path.name,
+                        caption="Coach checklist CSV export",
+                        **self._thread_kwargs_for_send(str(chat_id), str(thread_id) if thread_id is not None else None, {"thread_id": str(thread_id)} if thread_id is not None else None),
+                    )
+            except Exception as exc:
+                logger.error("[%s] Coach checklist export failed: %s", self.name, exc, exc_info=True)
+                await msg.reply_text("Coach checklist export failed. Check gateway logs.")
+            return True
+
+        return False
+
+    async def _handle_coach_checklist_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+        """Capture incident-description text for an active checklist session."""
+        msg = self._effective_update_message(update)
+        if not msg or not msg.text or not getattr(msg, "from_user", None):
+            return False
+        try:
+            from gateway import coach_checklist as cc
+        except Exception:
+            return False
+        session = cc.active_trial_session(getattr(msg, "chat_id", None), getattr(msg.from_user, "id", None))
+        if session:
+            try:
+                session, result = cc.handle_trial_input(session.session_id, msg.text.strip())
+                if result == "attendance" and session:
+                    await msg.reply_text(
+                        cc.render_trial_attendance_prompt(session),
+                        reply_markup=InlineKeyboardMarkup(cc.trial_attendance_keyboard(session, InlineKeyboardButton)),
+                    )
+                elif result == "complete" and session:
+                    await msg.reply_text(
+                        cc.render_section(session),
+                        reply_markup=InlineKeyboardMarkup(cc.section_keyboard(session, InlineKeyboardButton)),
+                    )
+                elif session:
+                    await msg.reply_text(cc.render_trial_prompt(session))
+            except Exception as exc:
+                logger.error("[%s] Coach checklist trial intake failed: %s", self.name, exc, exc_info=True)
+                await msg.reply_text("Coach checklist trial/walk-in intake failed. Please notify management.")
+            return True
+
+        session = cc.active_incident_session(getattr(msg, "chat_id", None), getattr(msg.from_user, "id", None))
+        if not session:
+            return False
+        session.incident_notes = msg.text.strip()
+        try:
+            await asyncio.to_thread(cc.persist_submission, session)
+            confirm = cc.confirmation_text(session)
+            await msg.reply_text(confirm)
+            alert_chat = cc.management_chat_id()
+            if alert_chat:
+                await context.bot.send_message(chat_id=int(alert_chat), text=cc.incident_alert_text(session))
+        except Exception as exc:
+            logger.error("[%s] Coach checklist incident submission failed: %s", self.name, exc, exc_info=True)
+            await msg.reply_text("Coach checklist incident submission failed. Please notify management.")
+        return True
+
+    async def _handle_coach_checklist_callback(self, query: Any, data: str) -> bool:
+        """Handle KMFS coach checklist inline button callbacks."""
+        if not data.startswith("cc:"):
+            return False
+        try:
+            from gateway import coach_checklist as cc
+        except Exception as exc:
+            logger.error("[%s] Coach checklist callback module unavailable: %s", self.name, exc, exc_info=True)
+            await query.answer(text="Checklist unavailable.")
+            return True
+
+        parts = data.split(":", 3)
+        if len(parts) < 3:
+            await query.answer(text="Invalid checklist action.")
+            return True
+        _, session_id, action = parts[:3]
+        arg = parts[3] if len(parts) == 4 else None
+        msg = getattr(query, "message", None)
+        chat_id = getattr(msg, "chat_id", None)
+        if not cc.chat_allowed(chat_id, self.config.extra):
+            await query.answer(text="⛔ Not authorized in this chat.")
+            return True
+
+        if action == "trial" and arg is not None:
+            session, result = cc.handle_trial_attendance(session_id, arg)
+            if result == "expired" or not session:
+                await query.answer(text="This checklist has expired. Start a new one with /coachchecklist.")
+                return True
+            if result != "complete":
+                await query.answer(text="Invalid trial status.")
+                return True
+            await query.answer(text="Trial status saved")
+            await query.edit_message_text(
+                cc.render_section(session),
+                reply_markup=InlineKeyboardMarkup(cc.section_keyboard(session, InlineKeyboardButton)),
+            )
+            return True
+
+        session, result = cc.handle_action(session_id, action, arg)
+        if result == "expired" or not session:
+            await query.answer(text="This checklist has expired. Start a new one with /coachchecklist.")
+            try:
+                await query.edit_message_text("Checklist expired. Start a new one with /coachchecklist.", reply_markup=None)
+            except Exception:
+                pass
+            return True
+        if result == "already_submitted":
+            await query.answer(text="Already submitted.")
+            return True
+        if action == "cancel":
+            cc.remove_session(session_id)
+            await query.answer(text="Cancelled")
+            try:
+                await query.edit_message_text("Coach checklist cancelled.", reply_markup=None)
+            except Exception:
+                pass
+            return True
+        if action == "submit":
+            try:
+                await asyncio.to_thread(cc.persist_submission, session)
+                await query.answer(text="Submitted")
+                await query.edit_message_text(cc.confirmation_text(session), reply_markup=None)
+            except Exception as exc:
+                logger.error("[%s] Coach checklist submit failed: %s", self.name, exc, exc_info=True)
+                await query.answer(text="Submit failed.")
+            return True
+        if action == "incident":
+            await query.answer(text="Type the incident description.")
+            await query.edit_message_text(cc.incident_prompt(), reply_markup=None)
+            return True
+        try:
+            if session.status == "review":
+                await query.edit_message_text(
+                    cc.render_review(session),
+                    reply_markup=InlineKeyboardMarkup(cc.review_keyboard(session, InlineKeyboardButton)),
+                )
+            else:
+                await query.edit_message_text(
+                    cc.render_section(session),
+                    reply_markup=InlineKeyboardMarkup(cc.section_keyboard(session, InlineKeyboardButton)),
+                )
+            await query.answer()
+        except Exception as exc:
+            logger.warning("[%s] Coach checklist message edit failed: %s", self.name, exc)
+            await query.answer(text="Checklist updated; message could not be edited.")
+        return True
+
     def _notification_kwargs(
         self, metadata: Optional[Dict[str, Any]]
     ) -> Dict[str, Any]:
@@ -1687,26 +1898,45 @@ class TelegramAdapter(BasePlatformAdapter):
             try:
                 from telegram import (
                     BotCommand,
-                    BotCommandScopeAllPrivateChats,
+                    BotCommandScopeAllChatAdministrators,
                     BotCommandScopeAllGroupChats,
+                    BotCommandScopeAllPrivateChats,
+                    BotCommandScopeChat,
+                    BotCommandScopeChatAdministrators,
                     BotCommandScopeDefault,
                 )
                 from hermes_cli.commands import telegram_menu_commands
-                # Telegram allows up to 100 commands but has an undocumented
-                # payload size limit (~4KB total).  Limit to 30 core commands
-                # to stay well under the threshold while covering all categories.
                 menu_commands, hidden_count = telegram_menu_commands(max_commands=MAX_COMMANDS_PER_SCOPE)
                 bot_commands = [BotCommand(name, desc) for name, desc in menu_commands]
+                coach_enabled = bool(os.getenv("COACH_CHECKLIST_ALLOWED_CHAT_IDS"))
+                member_bot_commands = [BotCommand("coachchecklist", "Start coach checklist")] if coach_enabled else bot_commands
                 # Register for all scopes independently — Telegram picks the
                 # narrowest matching scope per chat type (forum topics fall
                 # through to AllGroupChats or Default).
-                for scope_cls in (BotCommandScopeDefault, BotCommandScopeAllPrivateChats, BotCommandScopeAllGroupChats):
-                    scope_name = scope_cls.__name__
+                scoped_commands = [
+                    (BotCommandScopeDefault(), bot_commands),
+                    (BotCommandScopeAllPrivateChats(), bot_commands),
+                    (BotCommandScopeAllGroupChats(), member_bot_commands),
+                ]
+                if coach_enabled:
+                    scoped_commands.append((BotCommandScopeAllChatAdministrators(), bot_commands))
+                for scope, commands_for_scope in scoped_commands:
+                    scope_name = scope.__class__.__name__
                     try:
-                        await self._bot.set_my_commands(bot_commands, scope=scope_cls())
-                        logger.info("[%s] set_my_commands OK for scope %s (%d cmds)", self.name, scope_name, len(bot_commands))
+                        await self._bot.set_my_commands(commands_for_scope, scope=scope)
+                        logger.info("[%s] set_my_commands OK for scope %s (%d cmds)", self.name, scope_name, len(commands_for_scope))
                     except Exception as scope_err:
                         logger.warning("[%s] set_my_commands FAILED for scope %s: %s", self.name, scope_name, scope_err)
+                if coach_enabled:
+                    raw_allowed = os.getenv("COACH_CHECKLIST_ALLOWED_CHAT_IDS", "")
+                    for raw_chat_id in [v.strip() for v in raw_allowed.split(",") if v.strip()]:
+                        try:
+                            chat_id = int(raw_chat_id)
+                            await self._bot.set_my_commands(member_bot_commands, scope=BotCommandScopeChat(chat_id=chat_id))
+                            await self._bot.set_my_commands(bot_commands, scope=BotCommandScopeChatAdministrators(chat_id=chat_id))
+                            logger.info("[%s] set_my_commands OK for coach checklist chat %s (members=%d admins=%d)", self.name, raw_chat_id, len(member_bot_commands), len(bot_commands))
+                        except Exception as scope_err:
+                            logger.warning("[%s] set_my_commands FAILED for coach checklist chat %s: %s", self.name, raw_chat_id, scope_err)
                 # Forum topics don't inherit AllGroupChats — Telegram resolves
                 # commands via BotCommandScopeChat(chat_id) for forum groups.
                 # Lazy registration happens in _ensure_forum_commands on first
@@ -3105,6 +3335,11 @@ class TelegramAdapter(BasePlatformAdapter):
         query_chat_type = getattr(query_chat, "type", None)
         query_thread_id = getattr(query_message, "message_thread_id", None)
         query_user_name = getattr(query.from_user, "first_name", None)
+
+        # --- Coach checklist callbacks (cc:session:action[:arg]) ---
+        if data.startswith("cc:"):
+            await self._handle_coach_checklist_callback(query, data)
+            return
 
         # --- Model picker callbacks ---
         if data.startswith(("mp:", "mm:", "mb", "mx", "mg:")):
@@ -4928,7 +5163,11 @@ class TelegramAdapter(BasePlatformAdapter):
                     return
                 from telegram import BotCommand, BotCommandScopeChat
                 from hermes_cli.commands import telegram_menu_commands
-                menu_commands, _ = telegram_menu_commands(max_commands=MAX_COMMANDS_PER_SCOPE)
+                coach_enabled = bool(os.getenv("COACH_CHECKLIST_ALLOWED_CHAT_IDS"))
+                if coach_enabled:
+                    menu_commands = [("coachchecklist", "Start coach checklist")]
+                else:
+                    menu_commands, _ = telegram_menu_commands(max_commands=MAX_COMMANDS_PER_SCOPE)
                 bot_commands = [BotCommand(name, desc) for name, desc in menu_commands]
                 await self._bot.set_my_commands(bot_commands, scope=BotCommandScopeChat(chat_id=chat_id))
                 self._forum_command_registered.add(chat_id)
@@ -4956,6 +5195,8 @@ class TelegramAdapter(BasePlatformAdapter):
         msg = self._effective_update_message(update)
         if not msg or not msg.text:
             return
+        if await self._handle_coach_checklist_text(update, context):
+            return
         if not self._should_process_message(msg):
             if self._should_observe_unmentioned_group_message(msg):
                 self._observe_unmentioned_group_message(msg, MessageType.TEXT, update_id=update.update_id)
@@ -4973,6 +5214,8 @@ class TelegramAdapter(BasePlatformAdapter):
         if not msg or not msg.text:
             return
         if not self._should_process_message(msg, is_command=True):
+            return
+        if await self._handle_coach_checklist_command(update, context):
             return
         await self._ensure_forum_commands(msg)
 

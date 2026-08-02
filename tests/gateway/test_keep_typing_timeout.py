@@ -31,6 +31,7 @@ from gateway.platforms.base import (
     Platform,
     PlatformConfig,
     SendResult,
+    _typing_indicator_config,
 )
 
 
@@ -198,3 +199,73 @@ class TestKeepTypingTimeoutPerTick:
         assert calls == [], (
             f"send_typing was called on a paused chat: {calls}"
         )
+
+    @pytest.mark.asyncio
+    async def test_typing_indicator_can_be_disabled(self, monkeypatch):
+        """Config/env disabled typing must not call platform send_typing."""
+        monkeypatch.setenv("HERMES_TELEGRAM_TYPING_ENABLED", "false")
+        adapter = _StubAdapter()
+        calls = []
+
+        async def recording_send_typing(chat_id, metadata=None):
+            calls.append(chat_id)
+
+        monkeypatch.setattr(adapter, "send_typing", recording_send_typing)
+
+        await adapter._keep_typing(chat_id="123", interval=0.1)
+
+        assert calls == []
+
+    @pytest.mark.asyncio
+    async def test_typing_indicator_max_seconds_caps_long_turns(self, monkeypatch):
+        """A max_seconds cap lets long gateway turns stop refreshing typing."""
+        adapter = _StubAdapter()
+        adapter._typing_max_seconds = 0.35
+        calls = []
+
+        async def recording_send_typing(chat_id, metadata=None):
+            calls.append(chat_id)
+
+        monkeypatch.setattr(adapter, "send_typing", recording_send_typing)
+        adapter.stop_typing = MagicMock(return_value=asyncio.sleep(0))
+
+        await asyncio.wait_for(
+            adapter._keep_typing(chat_id="123", interval=0.1),
+            timeout=1.0,
+        )
+
+        assert 1 <= len(calls) <= 5
+
+    def test_typing_indicator_config_supports_global_and_platform_overrides(self, monkeypatch):
+        """Gateway defaults can be narrowed per platform without impacting others."""
+        import hermes_cli.config as config_mod
+
+        monkeypatch.delenv("HERMES_GATEWAY_TYPING_ENABLED", raising=False)
+        monkeypatch.delenv("HERMES_GATEWAY_TYPING_MAX_SECONDS", raising=False)
+        monkeypatch.delenv("HERMES_TELEGRAM_TYPING_ENABLED", raising=False)
+        monkeypatch.delenv("HERMES_TELEGRAM_TYPING_MAX_SECONDS", raising=False)
+        monkeypatch.setattr(
+            config_mod,
+            "load_config",
+            lambda: {
+                "gateway": {"typing": {"enabled": True, "max_seconds": 60}},
+                "display": {
+                    "platforms": {
+                        "telegram": {"typing": {"enabled": False, "max_seconds": 10}}
+                    }
+                },
+            },
+        )
+
+        enabled, max_seconds = _typing_indicator_config(Platform.TELEGRAM)
+        assert enabled is False
+        assert max_seconds == 10
+
+    def test_typing_indicator_env_override_wins(self, monkeypatch):
+        """Env remains available for operators who need an emergency toggle."""
+        monkeypatch.setenv("HERMES_TELEGRAM_TYPING_ENABLED", "0")
+        monkeypatch.setenv("HERMES_TELEGRAM_TYPING_MAX_SECONDS", "5")
+
+        enabled, max_seconds = _typing_indicator_config(Platform.TELEGRAM)
+        assert enabled is False
+        assert max_seconds == 5

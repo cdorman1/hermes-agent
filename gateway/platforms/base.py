@@ -18,6 +18,7 @@ import sys
 import time
 import uuid
 from abc import ABC, abstractmethod
+from typing import Any
 from urllib.parse import urlsplit
 
 from utils import normalize_proxy_url
@@ -49,6 +50,85 @@ def _float_env(name: str, default: float) -> float:
         return float(raw)
     except (TypeError, ValueError):
         return default
+
+
+def _coerce_typing_bool(value: Any, default: bool) -> bool:
+    """Coerce bool-ish typing-indicator config values."""
+    if value is None:
+        return default
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on", "enabled"}:
+            return True
+        if lowered in {"0", "false", "no", "off", "disabled"}:
+            return False
+        return default
+    return bool(value)
+
+
+def _coerce_typing_seconds(value: Any, default: float = 0.0) -> float:
+    """Coerce typing-indicator second values; <=0 means unlimited/disabled cap."""
+    if value is None:
+        return default
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return default
+    return max(0.0, seconds)
+
+
+def _typing_indicator_config(platform) -> tuple[bool, float]:
+    """Return (enabled, max_seconds) for a platform typing indicator.
+
+    Config precedence, lowest to highest:
+      - defaults: enabled, unlimited duration
+      - gateway.typing.{enabled,max_seconds}
+      - display.platforms.<platform>.{typing_enabled,typing_max_seconds}
+      - display.platforms.<platform>.typing.{enabled,max_seconds}
+
+    Environment variables may override at startup:
+      - HERMES_GATEWAY_TYPING_ENABLED / HERMES_GATEWAY_TYPING_MAX_SECONDS
+      - HERMES_<PLATFORM>_TYPING_ENABLED / HERMES_<PLATFORM>_TYPING_MAX_SECONDS
+    """
+    enabled = True
+    max_seconds = 0.0
+    platform_name = _platform_name(platform)
+
+    try:
+        from hermes_cli.config import load_config as _load_config
+
+        cfg = _load_config()
+    except Exception:
+        cfg = {}
+
+    if isinstance(cfg, dict):
+        gateway_cfg = cfg.get("gateway", {})
+        typing_cfg = gateway_cfg.get("typing", {}) if isinstance(gateway_cfg, dict) else {}
+        if isinstance(typing_cfg, dict):
+            enabled = _coerce_typing_bool(typing_cfg.get("enabled"), enabled)
+            max_seconds = _coerce_typing_seconds(typing_cfg.get("max_seconds"), max_seconds)
+
+        display_cfg = cfg.get("display", {})
+        platforms_cfg = display_cfg.get("platforms", {}) if isinstance(display_cfg, dict) else {}
+        platform_cfg = platforms_cfg.get(platform_name, {}) if isinstance(platforms_cfg, dict) else {}
+        if isinstance(platform_cfg, dict):
+            enabled = _coerce_typing_bool(platform_cfg.get("typing_enabled"), enabled)
+            max_seconds = _coerce_typing_seconds(platform_cfg.get("typing_max_seconds"), max_seconds)
+            nested = platform_cfg.get("typing", {})
+            if isinstance(nested, dict):
+                enabled = _coerce_typing_bool(nested.get("enabled"), enabled)
+                max_seconds = _coerce_typing_seconds(nested.get("max_seconds"), max_seconds)
+
+    env_enabled = os.environ.get("HERMES_GATEWAY_TYPING_ENABLED")
+    env_max = os.environ.get("HERMES_GATEWAY_TYPING_MAX_SECONDS")
+    env_prefix = re.sub(r"[^A-Z0-9]+", "_", platform_name.upper()).strip("_")
+    if env_prefix:
+        env_enabled = os.environ.get(f"HERMES_{env_prefix}_TYPING_ENABLED", env_enabled)
+        env_max = os.environ.get(f"HERMES_{env_prefix}_TYPING_MAX_SECONDS", env_max)
+    enabled = _coerce_typing_bool(env_enabled, enabled)
+    max_seconds = _coerce_typing_seconds(env_max, max_seconds)
+
+    return enabled, max_seconds
 
 
 def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) -> dict | None:
@@ -1714,6 +1794,7 @@ class BasePlatformAdapter(ABC):
         # Chats where typing indicator is paused (e.g. during approval waits).
         # _keep_typing skips send_typing when the chat_id is in this set.
         self._typing_paused: set = set()
+        self._typing_indicator_enabled, self._typing_max_seconds = _typing_indicator_config(platform)
 
     @property
     def message_len_fn(self) -> Callable[[str], int]:
@@ -2735,13 +2816,19 @@ class BasePlatformAdapter(ABC):
         one of them succeeds within the 5s platform-side window, the bubble
         stays visible across provider stalls / upstream API timeouts.
         """
+        if not self._typing_indicator_enabled:
+            return
+
         # Bound each send_typing round-trip so the refresh cadence isn't
         # gated on network health.  Must stay below ``interval`` so a slow
         # call gets abandoned before the next scheduled tick.
         _send_typing_timeout = max(0.25, min(1.5, interval - 0.25))
+        started_at = time.monotonic()
         try:
             while True:
                 if stop_event is not None and stop_event.is_set():
+                    return
+                if self._typing_max_seconds > 0 and time.monotonic() - started_at >= self._typing_max_seconds:
                     return
                 if chat_id not in self._typing_paused:
                     try:

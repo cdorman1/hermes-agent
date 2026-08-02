@@ -3,13 +3,25 @@
 import json
 import logging
 import os
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
 
-from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt
+from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _is_telegram_quiet_hours, _next_quiet_hours_release, _should_queue_telegram_delivery, _is_p0_critical_exception, _load_quiet_hours_queue, _flush_quiet_hours_queue, _quiet_hours_queue_path
 from tools.env_passthrough import clear_env_passthrough
 from tools.credential_files import clear_credential_files
+
+
+@pytest.fixture(autouse=True)
+def _stable_non_quiet_delivery_time(monkeypatch, request):
+    """Keep legacy delivery tests deterministic regardless of local wall clock.
+
+    Signal Governor tests include "quiet_hours" in their test name and opt into
+    the real/patched quiet-hours behavior explicitly.
+    """
+    if "quiet_hours" not in request.node.name:
+        monkeypatch.setattr("cron.scheduler._is_telegram_quiet_hours", lambda now=None: False)
 
 
 class TestResolveOrigin:
@@ -808,6 +820,135 @@ class TestDeliverResultWrapping:
             _deliver_result(job, "Hello!")
 
         mirror_mock.assert_not_called()
+
+    def test_telegram_quiet_hours_queue_suppresses_non_critical_send(self, tmp_path):
+        """Non-critical Telegram cron deliveries should persist to disk instead of waking Chris."""
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        quiet_now = datetime(2026, 6, 10, 5, 30, tzinfo=timezone.utc)  # 00:30 America/Chicago
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("cron.scheduler._get_hermes_home", return_value=tmp_path), \
+             patch("cron.scheduler._quiet_hours_now", return_value=quiet_now):
+            job = {
+                "id": "quiet-job",
+                "name": "status-watchdog",
+                "deliver": "origin",
+                "origin": {"platform": "telegram", "chat_id": "123", "thread_id": "456"},
+            }
+            error = _deliver_result(job, "Routine status: all monitors green.")
+            entries = _load_quiet_hours_queue()
+
+        assert error is None
+        send_mock.assert_not_called()
+        assert len(entries) == 1
+        assert entries[0]["job_id"] == "quiet-job"
+        assert entries[0]["target"] == {"platform": "telegram", "chat_id": "123", "thread_id": "456"}
+        assert "Routine status" in entries[0]["content"]
+
+    def test_telegram_quiet_hours_p0_critical_bypasses_queue(self, tmp_path):
+        """P0 Critical immediate-action Telegram alerts are allowed through quiet hours."""
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        quiet_now = datetime(2026, 6, 10, 5, 30, tzinfo=timezone.utc)  # 00:30 America/Chicago
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("cron.scheduler._get_hermes_home", return_value=tmp_path), \
+             patch("cron.scheduler._quiet_hours_now", return_value=quiet_now):
+            job = {
+                "id": "p0-job",
+                "deliver": "origin",
+                "origin": {"platform": "telegram", "chat_id": "123"},
+            }
+            error = _deliver_result(job, "P0 Critical system outage cannot wait; human action needed now.")
+            entries = _load_quiet_hours_queue()
+
+        assert error is None
+        send_mock.assert_called_once()
+        assert entries == []
+
+    def test_quiet_hours_gate_does_not_affect_non_telegram_platforms(self, tmp_path):
+        """Quiet-hours gating is Telegram-specific; Discord deliveries still send immediately."""
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.DISCORD: pconfig}
+        quiet_now = datetime(2026, 6, 10, 5, 30, tzinfo=timezone.utc)  # 00:30 America/Chicago
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("cron.scheduler._get_hermes_home", return_value=tmp_path), \
+             patch("cron.scheduler._quiet_hours_now", return_value=quiet_now):
+            job = {
+                "id": "discord-job",
+                "deliver": "origin",
+                "origin": {"platform": "discord", "chat_id": "999"},
+            }
+            error = _deliver_result(job, "Routine Discord status.")
+            entries = _load_quiet_hours_queue()
+
+        assert error is None
+        send_mock.assert_called_once()
+        assert entries == []
+
+    def test_quiet_hours_queue_flush_releases_persisted_telegram_entries(self, tmp_path):
+        """Queued Telegram deliveries should be sent and removed after release."""
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        queue_path = tmp_path / "cron" / "signal_governor_telegram_delivery_queue.jsonl"
+        queue_path.parent.mkdir(parents=True)
+        queue_path.write_text(
+            json.dumps({
+                "created_at": "2026-06-10T05:30:00+00:00",
+                "release_after": "2000-01-01T12:00:00+00:00",
+                "job_id": "queued-job",
+                "job_name": "daily-brief",
+                "target": {"platform": "telegram", "chat_id": "123", "thread_id": None},
+                "content": "Deferred daily brief.",
+                "media_files": [],
+            }) + "\n",
+            encoding="utf-8",
+        )
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("cron.scheduler._get_hermes_home", return_value=tmp_path), \
+             patch("cron.scheduler._is_telegram_quiet_hours", return_value=False):
+            delivered = _flush_quiet_hours_queue()
+            queue_exists = _quiet_hours_queue_path().exists()
+
+        assert delivered == 1
+        send_mock.assert_called_once()
+        assert not queue_exists
+
+    def test_quiet_hours_window_and_p0_heuristic(self):
+        quiet_time = datetime(2026, 6, 10, 5, 30, tzinfo=timezone.utc)  # 00:30 America/Chicago
+        release_time = _next_quiet_hours_release(quiet_time)
+
+        assert _is_telegram_quiet_hours(quiet_time) is True
+        assert _is_telegram_quiet_hours(datetime(2026, 6, 10, 12, 30, tzinfo=timezone.utc)) is False
+        assert release_time.hour == 7
+        assert release_time.tzinfo is not None
+        assert _should_queue_telegram_delivery({"platform": "telegram"}, "routine", quiet_time) is True
+        assert _should_queue_telegram_delivery({"platform": "discord"}, "routine", quiet_time) is False
+        assert _is_p0_critical_exception("P0 Critical system outage cannot wait") is True
+        assert _is_p0_critical_exception("critical but routine summary") is False
 
     def test_origin_delivery_preserves_thread_id(self):
         """Origin delivery should forward thread_id to the send helper."""

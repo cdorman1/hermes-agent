@@ -1,21 +1,22 @@
 """Regression tests for #28712 — kanban dispatcher must not auto-promote
-worker-initiated ``kanban_block`` (sticky blocks), but must keep
-auto-recovering circuit-breaker blocks.
+worker-initiated ``kanban_block`` (sticky blocks) or circuit-breaker
+``gave_up`` blocks.
 
 The bug: when a worker called ``kanban_block(reason="review-required:
-...")`` to hand off to a human, the dispatcher's ``recompute_ready``
-would promote the task back to ``ready`` on the next tick.  The fresh
-worker found nothing to do (work already applied), exited cleanly, and
-got recorded as a ``protocol_violation`` → ``gave_up`` → promote → loop
-until manual intervention.
+...")`` or the retry circuit breaker called ``gave_up``, the
+``recompute_ready`` sweep could promote the task back to ``ready`` on
+the next tick. A fresh worker would find nothing fixed, crash or exit
+without a terminal transition, and the dispatcher would loop until
+manual intervention.
 
 These tests pin down:
 
 * Worker / operator-initiated blocks are sticky and survive
   ``recompute_ready``.
+* Legacy/manual blocked rows without a sticky event still auto-recover
+  when parent dependencies are satisfied.
 * Circuit-breaker blocks (``gave_up`` event, status flipped via
-  ``_record_task_failure``) still auto-recover — the original intent
-  of #40c1decb3 is preserved.
+  ``_record_task_failure``) are sticky until explicit recovery.
 * An explicit ``kanban_unblock`` clears the sticky state.
 * The full block → promote → crash → ``gave_up`` loop is broken after
   this fix: subsequent ticks leave the task blocked.
@@ -100,15 +101,16 @@ def test_worker_block_on_child_with_done_parents_is_still_sticky(kanban_home: Pa
 
 
 # ---------------------------------------------------------------------------
-# Circuit-breaker blocks still auto-recover (preserve #40c1decb3 intent)
+# Legacy/manual blocked rows without sticky events still auto-recover
 # ---------------------------------------------------------------------------
 
 
-def test_circuit_breaker_block_still_auto_promotes(kanban_home: Path) -> None:
-    """A child that was put into ``blocked`` *without* a worker-issued
-    ``kanban_block`` (e.g. circuit-breaker after repeated spawn
-    failures, manual DB triage) must still get auto-promoted when its
-    parents complete — preserves the pre-#28712 recovery semantics."""
+def test_manual_block_without_event_still_auto_promotes(kanban_home: Path) -> None:
+    """A child that was put into ``blocked`` without a sticky event
+    (for example, manual DB triage on an older board) must still get
+    auto-promoted when its parents complete. Sticky behavior is keyed
+    by explicit ``blocked``/``gave_up`` task events, not the status
+    value alone."""
     with kb.connect() as conn:
         parent = kb.create_task(conn, title="parent")
         child = kb.create_task(conn, title="child", parents=[parent])
@@ -132,11 +134,11 @@ def test_circuit_breaker_block_still_auto_promotes(kanban_home: Path) -> None:
         assert task.last_failure_error is None
 
 
-def test_gave_up_event_alone_does_not_make_block_sticky(kanban_home: Path) -> None:
-    """The circuit-breaker emits ``gave_up`` (not ``blocked``).  Make
-    sure ``_has_sticky_block`` doesn't accidentally treat ``gave_up``
-    as sticky — otherwise we'd regress the safety net for genuinely
-    transient crashes."""
+def test_gave_up_event_makes_circuit_breaker_block_sticky(kanban_home: Path) -> None:
+    """The circuit-breaker emits ``gave_up``. That event must be sticky;
+    otherwise parent-free or parent-satisfied tasks are auto-promoted by
+    the next dispatcher tick and immediately respawn into the same
+    crash loop."""
     with kb.connect() as conn:
         parent = kb.create_task(conn, title="parent")
         child = kb.create_task(conn, title="child", parents=[parent])
@@ -155,8 +157,8 @@ def test_gave_up_event_alone_does_not_make_block_sticky(kanban_home: Path) -> No
         conn.commit()
 
         promoted = kb.recompute_ready(conn)
-        assert promoted == 1
-        assert kb.get_task(conn, child).status == "ready"
+        assert promoted == 0
+        assert kb.get_task(conn, child).status == "blocked"
 
 
 # ---------------------------------------------------------------------------
