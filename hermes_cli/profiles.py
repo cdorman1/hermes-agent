@@ -342,7 +342,10 @@ def check_alias_collision(name: str) -> Optional[str]:
             if existing_path == str(expected):
                 try:
                     content = expected.read_text()
-                    if "hermes -p" in content:
+                    if (
+                        "hermes -p" in content
+                        or "/usr/local/sbin/hermes-profile-run" in content
+                    ):
                         return None  # it's our wrapper, safe to overwrite
                 except Exception:
                     pass
@@ -390,7 +393,9 @@ def create_wrapper_script(name: str, target: Optional[str] = None) -> Optional[P
     else:
         wrapper_path = wrapper_dir / canon
         try:
-            wrapper_path.write_text(f'#!/bin/sh\nexec hermes -p {profile} "$@"\n')
+            wrapper_path.write_text(
+                f'#!/bin/sh\nexec /usr/local/sbin/hermes-profile-run {profile} -- "$@"\n'
+            )
             wrapper_path.chmod(wrapper_path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
             return wrapper_path
         except OSError as e:
@@ -414,7 +419,10 @@ def remove_wrapper_script(name: str) -> bool:
             try:
                 # Verify it's our wrapper before removing
                 content = wrapper_path.read_text()
-                if "hermes -p" in content:
+                if (
+                    "hermes -p" in content
+                    or "/usr/local/sbin/hermes-profile-run" in content
+                ):
                     wrapper_path.unlink()
                     return True
             except Exception:

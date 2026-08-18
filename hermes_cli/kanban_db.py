@@ -6012,7 +6012,7 @@ def _default_spawn(
     *,
     board: Optional[str] = None,
 ) -> Optional[int]:
-    """Fire-and-forget ``hermes -p <profile> chat -q ...`` subprocess.
+    """Fire-and-forget sandboxed profile worker subprocess.
 
     Returns the spawned child's PID so the dispatcher can detect crashes
     before the claim TTL expires. The child's completion is still observed
@@ -6095,8 +6095,10 @@ def _default_spawn(
     env["HERMES_PROFILE"] = profile_arg
 
     cmd = [
-        *_resolve_hermes_argv(),
-        "-p", profile_arg,
+        "/usr/local/sbin/hermes-profile-run",
+        "--cwd", workspace,
+        profile_arg,
+        "--",
         # Worker subprocesses switch to a profile-scoped HERMES_HOME above,
         # so they see that profile's shell-hook allowlist instead of the
         # dispatcher's root allowlist. Pass --accept-hooks explicitly so

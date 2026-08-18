@@ -213,6 +213,37 @@ sys.path.insert(0, str(PROJECT_ROOT))
 # The flag is stripped from sys.argv so argparse never sees it.
 # Falls back to ~/.hermes/active_profile for sticky default.
 # ---------------------------------------------------------------------------
+def _require_production_profile_sandbox(profile_name: str) -> None:
+    """Reject known production profiles outside the systemd sandbox launcher."""
+    policy_path = Path("/etc/hermes/profile-access.json")
+    try:
+        import json as _json
+
+        policy = _json.loads(policy_path.read_text())
+        canonical = policy.get("aliases", {}).get(profile_name, profile_name)
+        is_production_profile = canonical in policy.get("profiles", {})
+    except (OSError, ValueError, TypeError):
+        is_production_profile = False
+    if not is_production_profile:
+        return
+
+    try:
+        cgroup = Path("/proc/self/cgroup").read_text()
+    except OSError:
+        cgroup = ""
+    approved_units = (
+        f"hermes-gateway-{canonical}.service",
+        f"hermes-profile-{canonical}-",
+    )
+    if not any(unit in cgroup for unit in approved_units):
+        print(
+            "Error: raw production profile execution is disabled. "
+            f"Use: hermes-profile-run {profile_name} -- <hermes arguments>",
+            file=sys.stderr,
+        )
+        sys.exit(77)
+
+
 def _apply_profile_override() -> None:
     """Pre-parse --profile/-p and set HERMES_HOME before module imports."""
     argv = sys.argv[1:]
@@ -253,6 +284,7 @@ def _apply_profile_override() -> None:
     hermes_home_env = os.environ.get("HERMES_HOME", "")
     if profile_name is None and hermes_home_env:
         if Path(hermes_home_env).parent.name == "profiles":
+            _require_production_profile_sandbox(Path(hermes_home_env).name)
             return
 
     # 2. If no flag, check active_profile in the hermes root
@@ -271,6 +303,7 @@ def _apply_profile_override() -> None:
 
     # 3. If we found a profile, resolve and set HERMES_HOME
     if profile_name is not None:
+        _require_production_profile_sandbox(profile_name)
         try:
             from hermes_cli.profiles import resolve_profile_env
 

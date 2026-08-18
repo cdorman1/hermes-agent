@@ -645,7 +645,7 @@ class TestWrapperScript:
         assert wrapper.name == "mybot"
         content = wrapper.read_text()
         assert content.startswith("#!/bin/sh")
-        assert "hermes -p mybot" in content
+        assert "/usr/local/sbin/hermes-profile-run mybot --" in content
 
     def test_creates_bat_on_windows(self, profile_env, monkeypatch):
         monkeypatch.setattr("sys.platform", "win32")
@@ -684,7 +684,7 @@ class TestWrapperScript:
 
     def test_custom_alias_target_on_posix(self, profile_env, monkeypatch):
         # Custom alias name pointing at a differently-named profile: the file
-        # is named after the alias, the -p content references the profile.
+        # is named after the alias, the sandbox launcher references the profile.
         monkeypatch.setattr("sys.platform", "darwin")
         from hermes_cli.profiles import create_wrapper_script
         wrapper = create_wrapper_script("rq", target="redqueen")
@@ -692,7 +692,7 @@ class TestWrapperScript:
         assert wrapper.name == "rq"
         content = wrapper.read_text()
         assert content.startswith("#!/bin/sh")
-        assert "hermes -p redqueen" in content
+        assert "/usr/local/sbin/hermes-profile-run redqueen --" in content
 
     def test_custom_alias_target_on_windows(self, profile_env, monkeypatch):
         # Regression: custom-name aliases must still produce an executable

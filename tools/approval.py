@@ -887,17 +887,27 @@ def _smart_approve(command: str, description: str) -> str:
     try:
         from agent.auxiliary_client import call_llm
 
+        approval_config = _get_approval_config()
+        configured_policy = str(approval_config.get("smart_policy", "") or "").strip()
+        working_directory = os.getcwd()
+        policy_section = (
+            f"\nMandatory configured policy:\n{configured_policy}\n"
+            if configured_policy
+            else ""
+        )
+
         prompt = f"""You are a security reviewer for an AI coding agent. A terminal command was flagged by pattern matching as potentially dangerous.
 
 Command: {command}
+Working directory: {working_directory}
 Flagged reason: {description}
 
-Assess the ACTUAL risk of this command. Many flagged commands are false positives — for example, `python -c "print('hello')"` is flagged as "script execution via -c flag" but is completely harmless.
+Assess the actual risk and apply the configured policy below. The configured policy is mandatory and takes precedence over general examples.{policy_section}
 
 Rules:
-- APPROVE if the command is clearly safe (benign script execution, safe file operations, development tools, package installs, git operations, etc.)
-- DENY if the command could genuinely damage the system (recursive delete of important paths, overwriting system files, fork bombs, wiping disks, dropping databases, etc.)
-- ESCALATE if you're uncertain
+- APPROVE only when the command is clearly permitted by the configured policy.
+- DENY when the command is explicitly prohibited by the configured policy or could genuinely damage or expose the system.
+- ESCALATE when the configured policy requires human approval, when path authorization is unclear, or when you are uncertain.
 
 Respond with exactly one word: APPROVE, DENY, or ESCALATE"""
 
