@@ -52,9 +52,16 @@ def test_trial_walk_in_collection_starts_before_task_sections(tmp_path, monkeypa
     assert "Trial showed" in buttons[0][0]["text"]
     assert "No-show" in buttons[0][1]["text"]
     session, result = cc.handle_trial_attendance(session.session_id, "showed")
+    assert result == "more"
+    assert session.status == "awaiting_trial_more"
+    assert session.trial_attendance == "showed"
+    assert len(session.trials) == 1
+    assert session.trials[0]["trial_first_name"] == "Jane"
+    assert "Add another trial/walk-in" in cc.render_trial_more_prompt(session)
+
+    session, result = cc.handle_trial_more_action(session.session_id, "trialdone")
     assert result == "complete"
     assert session.status == "active"
-    assert session.trial_attendance == "showed"
     assert "Student and Floor Presence" in cc.render_section(session)
 
 
@@ -66,6 +73,49 @@ def test_trial_walk_in_collection_can_be_skipped(tmp_path, monkeypatch):
     assert session.status == "active"
     assert session.trial_first_name is None
     assert "Student and Floor Presence" in cc.render_section(session)
+
+
+def test_trial_walk_in_skip_button_uses_callback_path(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    session = cc.create_session(User(), 7169074832)
+    buttons = cc.trial_prompt_keyboard(session, lambda text, callback_data: {"text": text, "callback_data": callback_data})
+    assert buttons == [[{"text": "Skip trial/walk-in", "callback_data": f"cc:{session.session_id}:trialskip"}]]
+
+    session, result = cc.skip_trial_intake(session.session_id)
+    assert result == "complete"
+    assert session.status == "active"
+    assert session.trial_first_name is None
+    assert "Student and Floor Presence" in cc.render_section(session)
+
+
+def test_multiple_trials_can_be_collected_before_checklist(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    session = cc.create_session(User(), 7169074832)
+
+    for value in ["Jane", "Doe", "jane@example.com", "555-111-2222"]:
+        session, _ = cc.handle_trial_input(session.session_id, value)
+    session, result = cc.handle_trial_attendance(session.session_id, "showed")
+    assert result == "more"
+
+    session, result = cc.handle_trial_more_action(session.session_id, "trialadd")
+    assert result == "add"
+    assert session.status == "awaiting_trial"
+    assert len(session.trials) == 1
+
+    for value in ["John", "Smith", "john@example.com", "555-333-4444"]:
+        session, _ = cc.handle_trial_input(session.session_id, value)
+    session, result = cc.handle_trial_attendance(session.session_id, "no_show")
+    assert result == "more"
+    assert len(session.trials) == 2
+    assert session.trials[1]["trial_first_name"] == "John"
+    assert session.trials[1]["trial_attendance"] == "no_show"
+    review = cc.render_review(session)
+    assert "1. Jane Doe" in review
+    assert "2. John Smith" in review
+
+    session, result = cc.handle_trial_more_action(session.session_id, "trialdone")
+    assert result == "complete"
+    assert session.status == "active"
 
 
 def test_toggling_task(tmp_path, monkeypatch):
@@ -162,7 +212,7 @@ def test_csv_export(tmp_path, monkeypatch):
 
     def fake_run(sql, capture=True):
         if "SELECT id, coach_name" in sql:
-            return "1|Coach One|coachuser|12345|7169074832|Jane|Doe|jane@example.com|555-123-4567|showed|2026-08-01 12:00:00+00|3|31|9.68|f|\n"
+            return "1|Coach One|coachuser|12345|7169074832|Jane|Doe|jane@example.com|555-123-4567|showed|[{\"trial_first_name\": \"Jane\"}]|2026-08-01 12:00:00+00|3|31|9.68|f|\n"
         return ""
 
     monkeypatch.setattr(cc, "_run_psql", fake_run)

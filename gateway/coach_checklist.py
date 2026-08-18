@@ -103,6 +103,7 @@ CREATE TABLE IF NOT EXISTS coach_shift_checklist_submissions (
     completion_percentage NUMERIC(5,2) NOT NULL,
     incident_reported BOOLEAN NOT NULL DEFAULT FALSE,
     incident_notes TEXT,
+    trial_students TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -199,7 +200,7 @@ def apply_migration() -> None:
     if not table:
         _run_psql(MIGRATION_SQL, capture=False)
         return
-    required_columns = {"trial_first_name", "trial_last_name", "trial_email", "trial_phone", "trial_attendance"}
+    required_columns = {"trial_first_name", "trial_last_name", "trial_email", "trial_phone", "trial_attendance", "trial_students"}
     existing = set(_run_psql("""
 SELECT column_name
 FROM information_schema.columns
@@ -223,13 +224,15 @@ class ChecklistSession:
     message_id: Optional[int] = None
     current_section: int = 0
     completed: List[bool] = field(default_factory=lambda: [False] * TOTAL_TASKS)
-    status: str = "awaiting_trial"  # awaiting_trial | awaiting_trial_attendance | active | review | awaiting_incident | submitted | cancelled
+    status: str = "awaiting_trial"  # awaiting_trial | awaiting_trial_attendance | awaiting_trial_more | active | review | awaiting_incident | submitted | cancelled
     trial_field_index: int = 0
     trial_first_name: Optional[str] = None
     trial_last_name: Optional[str] = None
     trial_email: Optional[str] = None
     trial_phone: Optional[str] = None
     trial_attendance: Optional[str] = None
+    trials: List[Dict[str, Optional[str]]] = field(default_factory=list)
+    current_trial: Dict[str, Optional[str]] = field(default_factory=dict)
     incident_notes: Optional[str] = None
     submitted_id: Optional[int] = None
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
@@ -258,6 +261,12 @@ class ChecklistSession:
         elif len(completed) > TOTAL_TASKS:
             completed = completed[:TOTAL_TASKS]
         data = {**data, "completed": completed}
+        raw_trials = data.get("trials") or []
+        if not isinstance(raw_trials, list):
+            raw_trials = []
+        data["trials"] = [dict(t) for t in raw_trials if isinstance(t, dict)]
+        raw_current = data.get("current_trial") or {}
+        data["current_trial"] = dict(raw_current) if isinstance(raw_current, dict) else {}
         return cls(**data)
 
 
@@ -388,6 +397,72 @@ def _trial_label(value: Optional[str]) -> str:
     return "—"
 
 
+def _trial_value(trial: Dict[str, Optional[str]], key: str) -> Optional[str]:
+    value = trial.get(key)
+    return str(value).strip() if value else None
+
+
+def _legacy_trial(session: ChecklistSession) -> Optional[Dict[str, Optional[str]]]:
+    trial = {
+        "trial_first_name": session.trial_first_name,
+        "trial_last_name": session.trial_last_name,
+        "trial_email": session.trial_email,
+        "trial_phone": session.trial_phone,
+        "trial_attendance": session.trial_attendance,
+    }
+    return trial if any(trial.values()) else None
+
+
+def trial_records(session: ChecklistSession) -> List[Dict[str, Optional[str]]]:
+    """Return completed trial/walk-in records, including legacy single-record state."""
+    records = [dict(t) for t in (session.trials or []) if isinstance(t, dict) and any(t.values())]
+    if not records:
+        legacy = _legacy_trial(session)
+        if legacy:
+            records.append(legacy)
+    return records
+
+
+def _current_trial_value(session: ChecklistSession, key: str) -> Optional[str]:
+    value = session.current_trial.get(key) if isinstance(session.current_trial, dict) else None
+    if value:
+        return str(value)
+    if not session.trials:
+        return getattr(session, key, None)
+    return None
+
+
+def _sync_first_trial_legacy_fields(session: ChecklistSession) -> None:
+    records = trial_records(session)
+    first = records[0] if records else {}
+    session.trial_first_name = _trial_value(first, "trial_first_name")
+    session.trial_last_name = _trial_value(first, "trial_last_name")
+    session.trial_email = _trial_value(first, "trial_email")
+    session.trial_phone = _trial_value(first, "trial_phone")
+    session.trial_attendance = _trial_value(first, "trial_attendance")
+
+
+def _append_current_trial(session: ChecklistSession, attendance: str) -> None:
+    current = dict(session.current_trial or {})
+    current["trial_attendance"] = attendance
+    if any(current.get(key) for key, _ in TRIAL_FIELDS) or attendance:
+        session.trials.append(current)
+    session.current_trial = {}
+    session.trial_field_index = 0
+    _sync_first_trial_legacy_fields(session)
+
+
+def _trial_summary_lines(session: ChecklistSession) -> List[str]:
+    records = trial_records(session)
+    if not records:
+        return ["Recorded trials/walk-ins: none yet"]
+    lines = [f"Recorded trials/walk-ins: {len(records)}"]
+    for idx, trial in enumerate(records, 1):
+        name = " ".join(part for part in [_trial_value(trial, "trial_first_name"), _trial_value(trial, "trial_last_name")] if part).strip() or "—"
+        lines.append(f"{idx}. {name} — {_trial_label(_trial_value(trial, 'trial_attendance'))}")
+    return lines
+
+
 def render_trial_prompt(session: ChecklistSession) -> str:
     idx = max(0, min(session.trial_field_index, len(TRIAL_FIELDS) - 1))
     _, label = TRIAL_FIELDS[idx]
@@ -396,13 +471,16 @@ def render_trial_prompt(session: ChecklistSession) -> str:
         "Section 1: Trials / Walk-ins",
         "",
         "Enter trial or walk-in student information before starting the shift checklist.",
-        "If there is no trial/walk-in, reply `skip`.",
+        "Reply to this message so the bot receives the information in the group.",
+        "If there are no trials/walk-ins, reply `skip`.",
         "",
-        f"First name: {session.trial_first_name or '—'}",
-        f"Last name: {session.trial_last_name or '—'}",
-        f"Email address: {session.trial_email or '—'}",
-        f"Phone number: {session.trial_phone or '—'}",
-        f"Trial status: {_trial_label(session.trial_attendance)}",
+        *_trial_summary_lines(session),
+        "",
+        "Current trial/walk-in:",
+        f"First name: {_current_trial_value(session, 'trial_first_name') or '—'}",
+        f"Last name: {_current_trial_value(session, 'trial_last_name') or '—'}",
+        f"Email address: {_current_trial_value(session, 'trial_email') or '—'}",
+        f"Phone number: {_current_trial_value(session, 'trial_phone') or '—'}",
         "",
         f"Please enter: {label}",
     ]
@@ -414,21 +492,69 @@ def render_trial_attendance_prompt(session: ChecklistSession) -> str:
         "🥋 Coach On Shift Checklist",
         "Section 1: Trials / Walk-ins",
         "",
-        f"Name: {' '.join(part for part in [session.trial_first_name, session.trial_last_name] if part).strip() or '—'}",
-        f"Email: {session.trial_email or '—'}",
-        f"Phone: {session.trial_phone or '—'}",
+        *_trial_summary_lines(session),
+        "",
+        "Current trial/walk-in:",
+        f"Name: {' '.join(part for part in [_current_trial_value(session, 'trial_first_name'), _current_trial_value(session, 'trial_last_name')] if part).strip() or '—'}",
+        f"Email: {_current_trial_value(session, 'trial_email') or '—'}",
+        f"Phone: {_current_trial_value(session, 'trial_phone') or '—'}",
         "",
         "Select trial/walk-in status:",
     ])
 
 
+def render_trial_more_prompt(session: ChecklistSession) -> str:
+    return "\n".join([
+        "🥋 Coach On Shift Checklist",
+        "Section 1: Trials / Walk-ins",
+        "",
+        *_trial_summary_lines(session),
+        "",
+        "Add another trial/walk-in, or continue to the shift checklist.",
+    ])
+
+
 def trial_attendance_keyboard(session: ChecklistSession, button_factory: Any) -> Any:
-    showed = "✅ Trial showed" if session.trial_attendance == "showed" else "⬜️ Trial showed"
-    no_show = "✅ No-show" if session.trial_attendance == "no_show" else "⬜️ No-show"
+    showed = "✅ Trial showed" if _current_trial_value(session, "trial_attendance") == "showed" else "⬜️ Trial showed"
+    no_show = "✅ No-show" if _current_trial_value(session, "trial_attendance") == "no_show" else "⬜️ No-show"
     return [[
         button_factory(showed, callback_data=f"{CALLBACK_PREFIX}:{session.session_id}:trial:showed"),
         button_factory(no_show, callback_data=f"{CALLBACK_PREFIX}:{session.session_id}:trial:no_show"),
     ]]
+
+
+def trial_more_keyboard(session: ChecklistSession, button_factory: Any) -> Any:
+    return [
+        [button_factory("Add another trial/walk-in", callback_data=f"{CALLBACK_PREFIX}:{session.session_id}:trialadd")],
+        [button_factory("Continue to shift checklist", callback_data=f"{CALLBACK_PREFIX}:{session.session_id}:trialdone")],
+    ]
+
+
+def trial_prompt_keyboard(session: ChecklistSession, button_factory: Any) -> Any:
+    """Return the inline keyboard for trial/walk-in intake.
+
+    Telegram privacy mode may hide plain, unmentioned group messages from bots.
+    The skip button gives coaches a callback-based path that reliably reaches
+    the bot even when a plain ``skip`` text message does not.
+    """
+    return [[
+        button_factory(
+            "Skip trial/walk-in",
+            callback_data=f"{CALLBACK_PREFIX}:{session.session_id}:trialskip",
+        )
+    ]]
+
+
+def skip_trial_intake(session_id: str) -> Tuple[Optional[ChecklistSession], str]:
+    session = get_session(session_id)
+    if not session:
+        return None, "expired"
+    if session.status not in {"awaiting_trial", "awaiting_trial_attendance", "awaiting_trial_more"}:
+        return session, "ignored"
+    session.status = "active"
+    session.trial_field_index = 0
+    save_session(session)
+    return session, "complete"
 
 
 def handle_trial_input(session_id: str, text: str) -> Tuple[Optional[ChecklistSession], str]:
@@ -437,15 +563,14 @@ def handle_trial_input(session_id: str, text: str) -> Tuple[Optional[ChecklistSe
         return None, "expired"
     value = (text or "").strip()
     if value.lower() in {"skip", "none", "no", "n/a", "na"}:
-        session.status = "active"
-        session.trial_field_index = 0
-        save_session(session)
-        return session, "complete"
+        return skip_trial_intake(session_id)
     if session.status != "awaiting_trial":
         return session, "ignored"
     idx = max(0, min(session.trial_field_index, len(TRIAL_FIELDS) - 1))
     attr, _ = TRIAL_FIELDS[idx]
-    setattr(session, attr, value)
+    session.current_trial[attr] = value
+    if not session.trials:
+        setattr(session, attr, value)
     if idx >= len(TRIAL_FIELDS) - 1:
         session.status = "awaiting_trial_attendance"
         session.trial_field_index = len(TRIAL_FIELDS)
@@ -462,10 +587,31 @@ def handle_trial_attendance(session_id: str, value: str) -> Tuple[Optional[Check
         return None, "expired"
     if value not in {"showed", "no_show"}:
         return session, "unknown"
-    session.trial_attendance = value
-    session.status = "active"
+    if session.status != "awaiting_trial_attendance":
+        return session, "ignored"
+    _append_current_trial(session, value)
+    session.status = "awaiting_trial_more"
     save_session(session)
-    return session, "complete"
+    return session, "more"
+
+
+def handle_trial_more_action(session_id: str, action: str) -> Tuple[Optional[ChecklistSession], str]:
+    session = get_session(session_id)
+    if not session:
+        return None, "expired"
+    if session.status != "awaiting_trial_more":
+        return session, "ignored"
+    if action == "trialadd":
+        session.status = "awaiting_trial"
+        session.trial_field_index = 0
+        session.current_trial = {}
+        save_session(session)
+        return session, "add"
+    if action == "trialdone":
+        session.status = "active"
+        save_session(session)
+        return session, "complete"
+    return session, "unknown"
 
 
 def render_section(session: ChecklistSession) -> str:
@@ -489,7 +635,7 @@ def render_review(session: ChecklistSession) -> str:
     complete, total, pct = counts(session)
     now = datetime.now(timezone.utc).astimezone(CT)
     username = f"@{session.telegram_username}" if session.telegram_username else "—"
-    return "\n".join([
+    lines = [
         "📋 Review Coach Checklist",
         "",
         f"Coach name: {session.coach_name}",
@@ -501,14 +647,23 @@ def render_review(session: ChecklistSession) -> str:
         f"Completion percentage: {pct:.0f}%",
         "",
         "Trials / Walk-ins:",
-        f"First name: {session.trial_first_name or '—'}",
-        f"Last name: {session.trial_last_name or '—'}",
-        f"Email address: {session.trial_email or '—'}",
-        f"Phone number: {session.trial_phone or '—'}",
-        f"Trial status: {_trial_label(session.trial_attendance)}",
+    ]
+    records = trial_records(session)
+    if not records:
+        lines.append("—")
+    for idx, trial in enumerate(records, 1):
+        name = " ".join(part for part in [_trial_value(trial, "trial_first_name"), _trial_value(trial, "trial_last_name")] if part).strip() or "—"
+        lines.extend([
+            f"{idx}. {name}",
+            f"   Email address: {_trial_value(trial, 'trial_email') or '—'}",
+            f"   Phone number: {_trial_value(trial, 'trial_phone') or '—'}",
+            f"   Trial status: {_trial_label(_trial_value(trial, 'trial_attendance'))}",
+        ])
+    lines.extend([
         "",
         f"Incident reported: {'Yes' if session.incident_notes else 'No'}",
     ])
+    return "\n".join(lines)
 
 
 def section_keyboard(session: ChecklistSession, button_factory: Any) -> Any:
@@ -590,16 +745,17 @@ def persist_submission(session: ChecklistSession) -> int:
     complete, total, pct = counts(session)
     submitted_at = datetime.now(timezone.utc).isoformat()
     incident = bool(session.incident_notes)
+    trial_students = json.dumps(trial_records(session), ensure_ascii=False)
     sql = f"""
 WITH inserted AS (
   INSERT INTO coach_shift_checklist_submissions (
     telegram_user_id, telegram_username, coach_name, telegram_chat_id,
-    trial_first_name, trial_last_name, trial_email, trial_phone, trial_attendance,
+    trial_first_name, trial_last_name, trial_email, trial_phone, trial_attendance, trial_students,
     submitted_at, completed_task_count, total_task_count, completion_percentage,
     incident_reported, incident_notes
   ) VALUES (
     {int(session.telegram_user_id)}, {_sql_quote(session.telegram_username)}, {_sql_quote(session.coach_name)}, {int(session.telegram_chat_id)},
-    {_sql_quote(session.trial_first_name)}, {_sql_quote(session.trial_last_name)}, {_sql_quote(session.trial_email)}, {_sql_quote(session.trial_phone)}, {_sql_quote(session.trial_attendance)},
+    {_sql_quote(session.trial_first_name)}, {_sql_quote(session.trial_last_name)}, {_sql_quote(session.trial_email)}, {_sql_quote(session.trial_phone)}, {_sql_quote(session.trial_attendance)}, {_sql_quote(trial_students)},
     {_sql_quote(submitted_at)}, {complete}, {total}, {pct:.2f}, {'TRUE' if incident else 'FALSE'}, {_sql_quote(session.incident_notes)}
   ) RETURNING id
 )
@@ -719,7 +875,7 @@ def export_csv() -> Path:
     out = _run_psql(
         """
 SELECT id, coach_name, COALESCE(telegram_username, ''), telegram_user_id, telegram_chat_id,
-       COALESCE(trial_first_name, ''), COALESCE(trial_last_name, ''), COALESCE(trial_email, ''), COALESCE(trial_phone, ''), COALESCE(trial_attendance, ''),
+       COALESCE(trial_first_name, ''), COALESCE(trial_last_name, ''), COALESCE(trial_email, ''), COALESCE(trial_phone, ''), COALESCE(trial_attendance, ''), COALESCE(trial_students, ''),
        submitted_at, completed_task_count, total_task_count, completion_percentage,
        incident_reported, COALESCE(incident_notes, '')
 FROM coach_shift_checklist_submissions
@@ -740,6 +896,7 @@ ORDER BY submitted_at DESC;
             "Trial email address",
             "Trial phone number",
             "Trial showed/no-show",
+            "All trials/walk-ins JSON",
             "Submitted at",
             "Completed task count",
             "Total task count",
