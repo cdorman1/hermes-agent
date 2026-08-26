@@ -18,6 +18,17 @@ _HERMES_HOME_OVERRIDE: ContextVar[str | object] = ContextVar(
     "_HERMES_HOME_OVERRIDE", default=_UNSET
 )
 
+_PRODUCTION_PROFILE_ROOT = Path("/srv/hermes/profiles")
+_NFT_SHARED_RUNTIME_PROFILES = frozenset(
+    {
+        "nft-ads",
+        "nft-calendar",
+        "nft-enrollment",
+        "nft-enrollment-audit",
+    }
+)
+_NFT_SHARED_RUNTIME_GROUP = "hermes-nft-family"
+
 # ── TUI busy-indicator styles ─────────────────────────────────────────
 # Single source of truth shared by the CLI /indicator command, the TUI
 # gateway config handler, and the /help command registry. Keep in sync
@@ -1014,8 +1025,40 @@ def display_hermes_home() -> str:
         return str(home)
 
 
+def _group_name_for_gid(gid: int) -> str | None:
+    """Return a POSIX group name without making this module non-portable."""
+    try:
+        import grp
+
+        return grp.getgrgid(gid).gr_name
+    except (ImportError, KeyError, OSError):
+        return None
+
+
+def _secure_parent_mode(parent: Path) -> int:
+    """Return the deployment-safe mode for a credential parent directory."""
+    profile = os.environ.get("HERMES_PROFILE", "").strip()
+    if (
+        os.environ.get("HERMES_PROFILE_SANDBOXED") == "1"
+        and profile in _NFT_SHARED_RUNTIME_PROFILES
+        and parent == (_PRODUCTION_PROFILE_ROOT / profile).resolve()
+    ):
+        try:
+            group_name = _group_name_for_gid(parent.stat().st_gid)
+        except OSError:
+            group_name = None
+        if group_name == _NFT_SHARED_RUNTIME_GROUP:
+            return 0o2770
+    return 0o700
+
+
 def secure_parent_dir(path: Path) -> None:
-    """Chmod ``0o700`` on the parent directory of *path*, but only if safe.
+    """Restrict the parent directory of *path*, but only if safe.
+
+    The default is owner-only ``0o700``. Four policy-managed NFT subordinate
+    runtime roots retain ``0o2770`` only inside the trusted production sandbox
+    and only when their group is the dedicated ``hermes-nft-family`` group.
+    Credential files themselves remain owner-only.
 
     Refuses to chmod ``/`` or any top-level directory (resolved parent with
     fewer than 3 parts, i.e. ``/`` or any direct child like ``/usr``) to
@@ -1053,7 +1096,7 @@ def secure_parent_dir(path: Path) -> None:
         )
         return
     try:
-        os.chmod(parent, 0o700)
+        os.chmod(parent, _secure_parent_mode(parent))
     except OSError:
         pass
 

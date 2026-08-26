@@ -551,6 +551,69 @@ class TestSecureParentDir:
         assert len(called_with) == 1
         assert called_with[0] == (str(safe_dir), 0o700)
 
+    @pytest.mark.parametrize(
+        "profile",
+        ["nft-ads", "nft-calendar", "nft-enrollment", "nft-enrollment-audit"],
+    )
+    def test_nft_shared_runtime_preserves_setgid_group_mode(
+        self, profile, tmp_path, monkeypatch
+    ):
+        """The trusted NFT child sandbox retains NFT-Ops one-way access."""
+        profile_root = tmp_path / "srv" / "hermes" / "profiles"
+        runtime = profile_root / profile
+        runtime.mkdir(parents=True)
+        monkeypatch.setattr(hermes_constants, "_PRODUCTION_PROFILE_ROOT", profile_root)
+        monkeypatch.setattr(
+            hermes_constants,
+            "_group_name_for_gid",
+            lambda _gid: "hermes-nft-family",
+        )
+        monkeypatch.setenv("HERMES_PROFILE_SANDBOXED", "1")
+        monkeypatch.setenv("HERMES_PROFILE", profile)
+        called_with = []
+        monkeypatch.setattr(os, "chmod", lambda p, m: called_with.append((str(p), m)))
+
+        secure_parent_dir(runtime / "auth.json")
+
+        assert called_with == [(str(runtime), 0o2770)]
+
+    @pytest.mark.parametrize(
+        ("sandboxed", "profile", "use_exact_path", "group_name"),
+        [
+            ("0", "nft-ads", True, "hermes-nft-family"),
+            ("1", "personal-assistant", True, "hermes-nft-family"),
+            ("1", "nft-ads", False, "hermes-nft-family"),
+            ("1", "nft-ads", True, "hp-nft-ads"),
+        ],
+    )
+    def test_nft_shared_runtime_exception_fails_closed(
+        self,
+        sandboxed,
+        profile,
+        use_exact_path,
+        group_name,
+        tmp_path,
+        monkeypatch,
+    ):
+        """Every missing or mismatched guard falls back to owner-only mode."""
+        profile_root = tmp_path / "srv" / "hermes" / "profiles"
+        runtime = profile_root / profile
+        if not use_exact_path:
+            runtime = tmp_path / "other" / profile
+        runtime.mkdir(parents=True)
+        monkeypatch.setattr(hermes_constants, "_PRODUCTION_PROFILE_ROOT", profile_root)
+        monkeypatch.setattr(
+            hermes_constants, "_group_name_for_gid", lambda _gid: group_name
+        )
+        monkeypatch.setenv("HERMES_PROFILE_SANDBOXED", sandboxed)
+        monkeypatch.setenv("HERMES_PROFILE", profile)
+        called_with = []
+        monkeypatch.setattr(os, "chmod", lambda p, m: called_with.append((str(p), m)))
+
+        secure_parent_dir(runtime / "auth.json")
+
+        assert called_with == [(str(runtime), 0o700)]
+
     def test_root_dir_skipped(self, monkeypatch):
         """Parent resolving to / must NOT be chmod'd."""
         called_with = []
