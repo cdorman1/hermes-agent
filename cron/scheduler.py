@@ -24,8 +24,9 @@ import subprocess
 import sys
 import threading
 import time
+import tempfile
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
 try:
@@ -38,6 +39,7 @@ except ImportError:
         msvcrt = None
 from pathlib import Path
 from typing import Any, List, Optional, Protocol
+from zoneinfo import ZoneInfo
 
 # Add parent directory to path for imports BEFORE repo-level imports.
 # Without this, standalone invocations (e.g. after `hermes update` reloads
@@ -2890,6 +2892,220 @@ def _resolve_delivery_target(job: dict) -> Optional[dict]:
     return targets[0] if targets else None
 
 
+# Sentinel Forge quiet-hours policy: cron work continues around the clock, but
+# routine Telegram delivery is deferred from midnight through 06:59 Chicago
+# time. The queue is profile-scoped through HERMES_HOME.
+_QUIET_HOURS_TZ = ZoneInfo("America/Chicago")
+_QUIET_HOURS_START_HOUR = 0
+_QUIET_HOURS_END_HOUR = 7
+_QUIET_HOURS_QUEUE_FILE = "signal_governor_telegram_delivery_queue.jsonl"
+_P0_EXCEPTION_TERMS = (
+    "safety",
+    "legal",
+    "compliance emergency",
+    "active customer",
+    "student incident",
+    "customer incident",
+    "system outage",
+    "immediate money loss",
+    "command-channel failure",
+    "command channel failure",
+    "home security offline",
+    "vehicle unsafe",
+    "cannot wait",
+    "can't wait",
+)
+
+
+def _quiet_hours_now() -> datetime:
+    return datetime.now(_QUIET_HOURS_TZ)
+
+
+def _is_telegram_quiet_hours(now: datetime | None = None) -> bool:
+    current = now or _quiet_hours_now()
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=_QUIET_HOURS_TZ)
+    current = current.astimezone(_QUIET_HOURS_TZ)
+    return _QUIET_HOURS_START_HOUR <= current.hour < _QUIET_HOURS_END_HOUR
+
+
+def _next_quiet_hours_release(now: datetime | None = None) -> datetime:
+    current = (now or _quiet_hours_now()).astimezone(_QUIET_HOURS_TZ)
+    release = current.replace(
+        hour=_QUIET_HOURS_END_HOUR,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    if current >= release:
+        release += timedelta(days=1)
+    return release
+
+
+def _is_p0_critical_exception(content: str) -> bool:
+    """Recognize the existing narrow P0 immediate-action delivery exception."""
+    text = (content or "").lower()
+    if "p0" not in text and "critical" not in text:
+        return False
+    return any(term in text for term in _P0_EXCEPTION_TERMS)
+
+
+def _quiet_hours_queue_path() -> Path:
+    cron_dir = _get_hermes_home() / "cron"
+    cron_dir.mkdir(parents=True, exist_ok=True)
+    return cron_dir / _QUIET_HOURS_QUEUE_FILE
+
+
+def _append_quiet_hours_queue(
+    job: dict,
+    target: dict,
+    content: str,
+    media_files: list | None = None,
+) -> Path:
+    """Persist one deferred Telegram delivery in the active profile."""
+    now = _quiet_hours_now()
+    entry = {
+        "created_at": now.astimezone(timezone.utc).isoformat(),
+        "release_after": _next_quiet_hours_release(now)
+        .astimezone(timezone.utc)
+        .isoformat(),
+        "job_id": job.get("id", ""),
+        "job_name": job.get("name", ""),
+        "target": {
+            "platform": "telegram",
+            "chat_id": str(target.get("chat_id", "")),
+            "thread_id": target.get("thread_id"),
+        },
+        "content": content,
+        "media_files": list(media_files or []),
+    }
+    path = _quiet_hours_queue_path()
+    payload = (json.dumps(entry, ensure_ascii=False) + "\n").encode("utf-8")
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        os.write(fd, payload)
+    finally:
+        os.close(fd)
+    return path
+
+
+def _load_quiet_hours_queue() -> list[dict]:
+    path = _quiet_hours_queue_path()
+    if not path.exists():
+        return []
+    entries: list[dict] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError as exc:
+                logger.warning("Skipping malformed quiet-hours queue entry: %s", exc)
+                continue
+            if isinstance(entry, dict):
+                entries.append(entry)
+    return entries
+
+
+def _write_quiet_hours_queue(entries: list[dict]) -> None:
+    path = _quiet_hours_queue_path()
+    if not entries:
+        path.unlink(missing_ok=True)
+        return
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=str(path.parent),
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            for entry in entries:
+                handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        os.chmod(tmp_name, 0o600)
+        os.replace(tmp_name, path)
+    finally:
+        if os.path.exists(tmp_name):
+            os.unlink(tmp_name)
+
+
+def _should_queue_telegram_delivery(
+    target: dict,
+    content: str,
+    now: datetime | None = None,
+) -> bool:
+    if str(target.get("platform", "")).lower() != "telegram":
+        return False
+    return _is_telegram_quiet_hours(now) and not _is_p0_critical_exception(content)
+
+
+def _send_queued_telegram_entry(entry: dict) -> str | None:
+    from gateway.config import Platform, load_gateway_config
+    from tools.send_message_tool import _send_to_platform
+
+    config = load_gateway_config()
+    platform = Platform.TELEGRAM
+    pconfig = config.platforms.get(platform)
+    if not pconfig or not pconfig.enabled:
+        return "telegram platform not configured/enabled"
+    target = entry.get("target") or {}
+    chat_id = str(target.get("chat_id", ""))
+    if not chat_id:
+        return "queued telegram target missing chat_id"
+    result = asyncio.run(
+        _send_to_platform(
+            platform,
+            pconfig,
+            chat_id,
+            str(entry.get("content", "")),
+            thread_id=target.get("thread_id"),
+            media_files=entry.get("media_files") or [],
+        )
+    )
+    if result and result.get("error"):
+        return str(result["error"])
+    return None
+
+
+def _flush_quiet_hours_queue(force: bool = False) -> int:
+    """Deliver released entries, retaining failures for the next tick."""
+    if not force and _is_telegram_quiet_hours():
+        return 0
+    entries = _load_quiet_hours_queue()
+    if not entries:
+        return 0
+    now_utc = datetime.now(timezone.utc)
+    remaining: list[dict] = []
+    delivered = 0
+    for entry in entries:
+        try:
+            release_dt = datetime.fromisoformat(str(entry.get("release_after") or ""))
+            if release_dt.tzinfo is None:
+                release_dt = release_dt.replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError):
+            release_dt = now_utc
+        if not force and release_dt > now_utc:
+            remaining.append(entry)
+            continue
+        try:
+            error = _send_queued_telegram_entry(entry)
+        except Exception as exc:
+            error = str(exc)
+        if error:
+            logger.warning(
+                "Quiet-hours Telegram delivery failed; retaining queued entry: %s",
+                error,
+            )
+            remaining.append(entry)
+        else:
+            delivered += 1
+    _write_quiet_hours_queue(remaining)
+    if delivered:
+        logger.info("Delivered %d quiet-hours Telegram message(s)", delivered)
+    return delivered
+
+
 # Media extension sets — audio routing is centralized in gateway.platforms.base
 # via should_send_media_as_audio() so Telegram-specific rules stay in one place.
 _VIDEO_EXTS = frozenset({'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'})
@@ -3196,6 +3412,21 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             bot_chat_error = _deliver_to_bot_chat(job, content, chat_id)
             if bot_chat_error:
                 delivery_errors.append(bot_chat_error)
+            continue
+
+        if _should_queue_telegram_delivery(target, cleaned_delivery_content):
+            queue_path = _append_quiet_hours_queue(
+                job,
+                target,
+                cleaned_delivery_content,
+                media_files,
+            )
+            logger.info(
+                "Job '%s': deferred routine Telegram delivery until 07:00 "
+                "America/Chicago (%s)",
+                job["id"],
+                queue_path,
+            )
             continue
 
         # Diagnostic: log thread_id for topic-aware delivery debugging
@@ -7638,6 +7869,11 @@ def tick(
         if can_dispatch is not None and not can_dispatch():
             logger.debug("Cron dispatch paused while gateway drains existing work")
             return 0
+
+        try:
+            _flush_quiet_hours_queue()
+        except Exception as exc:
+            logger.warning("Quiet-hours Telegram queue flush failed: %s", exc)
 
         # Dead-owner claim reclaim (#86721): execution rows carry their owner
         # pid + process start time, but recovery previously ran only at
