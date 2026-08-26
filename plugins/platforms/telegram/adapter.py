@@ -215,6 +215,11 @@ from plugins.platforms.telegram.telegram_network import (
     discover_fallback_ips,
     parse_fallback_ip_env,
 )
+from plugins.platforms.telegram.coach_checklist import (
+    CoachChecklistTelegramMixin,
+    coach_checklist_admin_menu_commands,
+    coach_checklist_member_menu_commands,
+)
 from utils import atomic_replace, env_float, env_int
 
 _TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
@@ -570,7 +575,7 @@ class _PollingLifecycleAbort(RuntimeError):
     """Internal control flow for polling startup fenced by teardown."""
 
 
-class TelegramAdapter(BasePlatformAdapter):
+class TelegramAdapter(CoachChecklistTelegramMixin, BasePlatformAdapter):
     """
     Telegram bot adapter.
 
@@ -4086,8 +4091,11 @@ class TelegramAdapter(BasePlatformAdapter):
             try:
                 from telegram import (
                     BotCommand,
+                    BotCommandScopeAllChatAdministrators,
                     BotCommandScopeAllPrivateChats,
                     BotCommandScopeAllGroupChats,
+                    BotCommandScopeChat,
+                    BotCommandScopeChatAdministrators,
                     BotCommandScopeDefault,
                 )
                 from hermes_cli.commands import telegram_menu_commands, telegram_menu_max_commands
@@ -4101,16 +4109,68 @@ class TelegramAdapter(BasePlatformAdapter):
                 max_commands = telegram_menu_max_commands()
                 menu_commands, hidden_count = telegram_menu_commands(max_commands=max_commands)
                 bot_commands = [BotCommand(name, desc) for name, desc in menu_commands]
+                coach_enabled = self._coach_checklist_enabled()
+                member_commands = (
+                    coach_checklist_member_menu_commands(
+                        menu_commands,
+                        max_commands=max_commands,
+                    )
+                    if coach_enabled
+                    else menu_commands
+                )
+                admin_commands = (
+                    coach_checklist_admin_menu_commands(
+                        menu_commands,
+                        max_commands=max_commands,
+                    )
+                    if coach_enabled
+                    else menu_commands
+                )
+                member_bot_commands = [
+                    BotCommand(name, desc) for name, desc in member_commands
+                ]
+                admin_bot_commands = [
+                    BotCommand(name, desc) for name, desc in admin_commands
+                ]
                 # Register for all scopes independently — Telegram picks the
                 # narrowest matching scope per chat type (forum topics fall
                 # through to AllGroupChats or Default).
-                for scope_cls in (BotCommandScopeDefault, BotCommandScopeAllPrivateChats, BotCommandScopeAllGroupChats):
+                scoped_commands = [
+                    (BotCommandScopeDefault(), bot_commands),
+                    (BotCommandScopeAllPrivateChats(), bot_commands),
+                    (BotCommandScopeAllGroupChats(), member_bot_commands),
+                ]
+                if coach_enabled:
+                    scoped_commands.append(
+                        (BotCommandScopeAllChatAdministrators(), admin_bot_commands)
+                    )
+                for scope, commands in scoped_commands:
+                    scope_cls = type(scope)
                     scope_name = getattr(scope_cls, "__name__", str(scope_cls))
                     try:
-                        await self._bot.set_my_commands(bot_commands, scope=scope_cls())
-                        logger.info("[%s] set_my_commands OK for scope %s (%d cmds)", self.name, scope_name, len(bot_commands))
+                        await self._bot.set_my_commands(commands, scope=scope)
+                        logger.info("[%s] set_my_commands OK for scope %s (%d cmds)", self.name, scope_name, len(commands))
                     except Exception as scope_err:
                         logger.warning("[%s] set_my_commands FAILED for scope %s: %s", self.name, scope_name, scope_err)
+                if coach_enabled:
+                    for raw_chat_id in sorted(self._coach_checklist_allowed_chat_ids()):
+                        try:
+                            chat_id = int(raw_chat_id)
+                            await self._bot.set_my_commands(
+                                member_bot_commands,
+                                scope=BotCommandScopeChat(chat_id=chat_id),
+                            )
+                            await self._bot.set_my_commands(
+                                admin_bot_commands,
+                                scope=BotCommandScopeChatAdministrators(chat_id=chat_id),
+                            )
+                        except Exception as scope_err:
+                            logger.warning(
+                                "[%s] Checklist command registration failed for chat %s: %s",
+                                self.name,
+                                raw_chat_id,
+                                scope_err,
+                            )
                 # Forum topics don't inherit AllGroupChats — Telegram resolves
                 # commands via BotCommandScopeChat(chat_id) for forum groups.
                 # Lazy registration happens in _ensure_forum_commands on first
@@ -7187,6 +7247,31 @@ class TelegramAdapter(BasePlatformAdapter):
         query_thread_id = getattr(query_message, "message_thread_id", None)
         query_user_name = getattr(query.from_user, "first_name", None)
 
+        # KMFS coach checklist callbacks are handled outside the LLM path.
+        if data.startswith("cc:"):
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=query_chat_id,
+                chat_type=(
+                    str(query_chat_type)
+                    if query_chat_type is not None
+                    else None
+                ),
+                thread_id=(
+                    str(query_thread_id)
+                    if query_thread_id is not None
+                    else None
+                ),
+                user_name=query_user_name,
+            ):
+                await query.answer(
+                    text="⛔ You are not authorized to use this checklist."
+                )
+                return
+            await self._handle_coach_checklist_callback(query, data, context)
+            return
+
         # --- Model picker callbacks ---
         if data.startswith(("mp:", "mpg:", "mpv:", "mm:", "mc:", "mb", "mx", "mg:")):
             chat_id = str(query.message.chat_id) if query.message else None
@@ -9638,11 +9723,36 @@ class TelegramAdapter(BasePlatformAdapter):
                 chat_id = int(chat.id)
                 if chat_id in self._forum_command_registered:
                     return
-                from telegram import BotCommand, BotCommandScopeChat
+                from telegram import (
+                    BotCommand,
+                    BotCommandScopeChat,
+                    BotCommandScopeChatAdministrators,
+                )
                 from hermes_cli.commands import telegram_menu_commands, telegram_menu_max_commands
-                menu_commands, _ = telegram_menu_commands(max_commands=telegram_menu_max_commands())
-                bot_commands = [BotCommand(name, desc) for name, desc in menu_commands]
+                max_commands = telegram_menu_max_commands()
+                menu_commands, _ = telegram_menu_commands(max_commands=max_commands)
+                checklist_chat = str(chat_id) in self._coach_checklist_allowed_chat_ids()
+                if checklist_chat:
+                    member_commands = coach_checklist_member_menu_commands(
+                        menu_commands,
+                        max_commands=max_commands,
+                    )
+                    admin_commands = coach_checklist_admin_menu_commands(
+                        menu_commands,
+                        max_commands=max_commands,
+                    )
+                else:
+                    member_commands = menu_commands
+                    admin_commands = menu_commands
+                bot_commands = [
+                    BotCommand(name, desc) for name, desc in member_commands
+                ]
                 await self._bot.set_my_commands(bot_commands, scope=BotCommandScopeChat(chat_id=chat_id))
+                if checklist_chat:
+                    await self._bot.set_my_commands(
+                        [BotCommand(name, desc) for name, desc in admin_commands],
+                        scope=BotCommandScopeChatAdministrators(chat_id=chat_id),
+                    )
                 self._forum_command_registered.add(chat_id)
                 logger.info("[%s] Lazy-registered %d commands for forum chat %s", self.name, len(bot_commands), chat_id)
             except Exception as e:
@@ -9679,6 +9789,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 getattr(getattr(msg, "chat", None), "id", None),
             )
             return
+        if await self._handle_coach_checklist_text(update, context):
+            return
         if not self._should_process_message(msg):
             if self._should_observe_unmentioned_group_message(msg):
                 self._observe_unmentioned_group_message(msg, MessageType.TEXT, update_id=update.update_id)
@@ -9704,6 +9816,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 getattr(getattr(msg, "from_user", None), "id", None),
                 getattr(getattr(msg, "chat", None), "id", None),
             )
+            return
+        if await self._handle_coach_checklist_command(update, context):
             return
         await self._ensure_forum_commands(msg)
 
