@@ -188,7 +188,15 @@ def _run_psql(sql: str, *, capture: bool = True) -> str:
     cmd = ["psql", "-X", "-v", "ON_ERROR_STOP=1", "-d", db_name()]
     if capture:
         cmd.extend(["-Atq"])
-    proc = subprocess.run(cmd, input=sql, text=True, capture_output=True, check=False)
+    proc = subprocess.run(
+        cmd,
+        input=sql,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        capture_output=True,
+        check=False,
+    )
     if proc.returncode != 0:
         stderr = (proc.stderr or "").strip()
         raise RuntimeError(f"psql failed: {stderr[:400]}")
