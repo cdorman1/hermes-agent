@@ -526,6 +526,54 @@ class TelegramAdapter(BasePlatformAdapter):
         display = " ".join(part for part in [first, last] if part).strip()
         return display or getattr(user, "username", None) or str(getattr(user, "id", "Coach"))
 
+    async def _safe_coach_checklist_edit(
+        self,
+        query: Any,
+        text: str,
+        *,
+        reply_markup: Any = None,
+        log_label: str = "message edit",
+    ) -> bool:
+        """Edit a coach-checklist message without turning Telegram throttles into failures."""
+        try:
+            await query.edit_message_text(text, reply_markup=reply_markup)
+            return True
+        except Exception as exc:
+            retry_after = getattr(exc, "retry_after", None)
+            if retry_after is None:
+                try:
+                    from telegram.error import RetryAfter
+                except ImportError:
+                    RetryAfter = ()  # type: ignore[assignment]
+                if RetryAfter and isinstance(exc, RetryAfter):
+                    retry_after = getattr(exc, "retry_after", None)
+            if retry_after is not None:
+                wait_seconds = max(float(retry_after) + 1.0, 1.0)
+                logger.warning(
+                    "[%s] Coach checklist %s throttled; retrying in %.1fs: %s",
+                    self.name,
+                    log_label,
+                    wait_seconds,
+                    exc,
+                )
+                await asyncio.sleep(wait_seconds)
+                try:
+                    await query.edit_message_text(text, reply_markup=reply_markup)
+                    return True
+                except Exception as retry_exc:
+                    logger.warning(
+                        "[%s] Coach checklist %s retry failed: %s",
+                        self.name,
+                        log_label,
+                        retry_exc,
+                    )
+                    return False
+            if "Message is not modified" in str(exc):
+                logger.debug("[%s] Coach checklist %s skipped: %s", self.name, log_label, exc)
+                return True
+            logger.warning("[%s] Coach checklist %s failed: %s", self.name, log_label, exc)
+            return False
+
     def _coach_checklist_admin_user_ids(self) -> set[str]:
         """Return Telegram user IDs allowed to run coach checklist admin commands in DMs."""
         raw_values: list[str] = []
@@ -712,9 +760,11 @@ class TelegramAdapter(BasePlatformAdapter):
                 await query.answer(text="Invalid trial status.")
                 return True
             await query.answer(text="Trial status saved")
-            await query.edit_message_text(
+            await self._safe_coach_checklist_edit(
+                query,
                 cc.render_trial_more_prompt(session),
                 reply_markup=InlineKeyboardMarkup(cc.trial_more_keyboard(session, InlineKeyboardButton)),
+                log_label="trial-more edit",
             )
             return True
 
@@ -725,7 +775,12 @@ class TelegramAdapter(BasePlatformAdapter):
                 return True
             if result == "add":
                 await query.answer(text="Add another trial/walk-in")
-                await query.edit_message_text(cc.render_trial_more_prompt(session), reply_markup=None)
+                await self._safe_coach_checklist_edit(
+                    query,
+                    cc.render_trial_more_prompt(session),
+                    reply_markup=None,
+                    log_label="trial-add edit",
+                )
                 await context.bot.send_message(
                     chat_id=chat_id,
                     text=cc.render_trial_prompt(session),
@@ -735,9 +790,11 @@ class TelegramAdapter(BasePlatformAdapter):
                 return True
             if result == "complete":
                 await query.answer(text="Starting shift checklist")
-                await query.edit_message_text(
+                await self._safe_coach_checklist_edit(
+                    query,
                     cc.render_section(session),
                     reply_markup=InlineKeyboardMarkup(cc.section_keyboard(session, InlineKeyboardButton)),
+                    log_label="section edit",
                 )
                 return True
             await query.answer(text="Trial/walk-in intake is not active.")
@@ -752,19 +809,23 @@ class TelegramAdapter(BasePlatformAdapter):
                 await query.answer(text="Trial/walk-in intake is not active.")
                 return True
             await query.answer(text="Trial/walk-in skipped")
-            await query.edit_message_text(
+            await self._safe_coach_checklist_edit(
+                query,
                 cc.render_section(session),
                 reply_markup=InlineKeyboardMarkup(cc.section_keyboard(session, InlineKeyboardButton)),
+                log_label="trial-skip section edit",
             )
             return True
 
         session, result = cc.handle_action(session_id, action, arg)
         if result == "expired" or not session:
             await query.answer(text="This checklist has expired. Start a new one with /coachchecklist.")
-            try:
-                await query.edit_message_text("Checklist expired. Start a new one with /coachchecklist.", reply_markup=None)
-            except Exception:
-                pass
+            await self._safe_coach_checklist_edit(
+                query,
+                "Checklist expired. Start a new one with /coachchecklist.",
+                reply_markup=None,
+                log_label="expired edit",
+            )
             return True
         if result == "already_submitted":
             await query.answer(text="Already submitted.")
@@ -772,36 +833,55 @@ class TelegramAdapter(BasePlatformAdapter):
         if action == "cancel":
             cc.remove_session(session_id)
             await query.answer(text="Cancelled")
-            try:
-                await query.edit_message_text("Coach checklist cancelled.", reply_markup=None)
-            except Exception:
-                pass
+            await self._safe_coach_checklist_edit(
+                query,
+                "Coach checklist cancelled.",
+                reply_markup=None,
+                log_label="cancel edit",
+            )
             return True
         if action == "submit":
             try:
                 await asyncio.to_thread(cc.persist_submission, session)
                 await query.answer(text="Submitted")
-                await query.edit_message_text(cc.confirmation_text(session), reply_markup=None)
+                await self._safe_coach_checklist_edit(
+                    query,
+                    cc.confirmation_text(session),
+                    reply_markup=None,
+                    log_label="submit confirmation edit",
+                )
             except Exception as exc:
                 logger.error("[%s] Coach checklist submit failed: %s", self.name, exc, exc_info=True)
                 await query.answer(text="Submit failed.")
             return True
         if action == "incident":
             await query.answer(text="Type the incident description.")
-            await query.edit_message_text(cc.incident_prompt(), reply_markup=None)
+            await self._safe_coach_checklist_edit(
+                query,
+                cc.incident_prompt(),
+                reply_markup=None,
+                log_label="incident prompt edit",
+            )
             return True
         try:
             if session.status == "review":
-                await query.edit_message_text(
+                edit_ok = await self._safe_coach_checklist_edit(
+                    query,
                     cc.render_review(session),
                     reply_markup=InlineKeyboardMarkup(cc.review_keyboard(session, InlineKeyboardButton)),
+                    log_label="review edit",
                 )
             else:
-                await query.edit_message_text(
+                edit_ok = await self._safe_coach_checklist_edit(
+                    query,
                     cc.render_section(session),
                     reply_markup=InlineKeyboardMarkup(cc.section_keyboard(session, InlineKeyboardButton)),
+                    log_label="section edit",
                 )
-            await query.answer()
+            if edit_ok:
+                await query.answer()
+            else:
+                await query.answer(text="Checklist updated; message could not be edited.")
         except Exception as exc:
             logger.warning("[%s] Coach checklist message edit failed: %s", self.name, exc)
             await query.answer(text="Checklist updated; message could not be edited.")

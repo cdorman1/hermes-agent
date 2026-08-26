@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import os
 import subprocess
-import types
 
 import pytest
 
 from gateway import coach_checklist as cc
+from gateway.config import Platform
+from gateway.platforms.telegram import TelegramAdapter
 
 
 class User:
@@ -251,3 +252,58 @@ def test_postgresql_persistence_round_trip(tmp_path, monkeypatch):
         assert out == f"1|{cc.TOTAL_TASKS}"
     finally:
         subprocess.run(["psql", "-X", "-d", cc.db_name(), "-Atqc", f"delete from coach_shift_checklist_submissions where id={submission_id}"], check=False)
+
+
+@pytest.mark.asyncio
+async def test_coach_checklist_edit_retries_telegram_flood_control(monkeypatch):
+    class RetryAfter(Exception):
+        retry_after = 2
+
+    sleeps = []
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+
+    monkeypatch.setattr("gateway.platforms.telegram.asyncio.sleep", fake_sleep)
+
+    class Query:
+        def __init__(self):
+            self.calls = 0
+
+        async def edit_message_text(self, text, reply_markup=None):
+            self.calls += 1
+            if self.calls == 1:
+                raise RetryAfter("Flood control exceeded")
+            self.text = text
+            self.reply_markup = reply_markup
+
+    adapter = TelegramAdapter.__new__(TelegramAdapter)
+    adapter.platform = Platform.TELEGRAM
+    query = Query()
+
+    ok = await TelegramAdapter._safe_coach_checklist_edit(
+        adapter,
+        query,
+        "confirmed",
+        reply_markup=None,
+        log_label="submit confirmation edit",
+    )
+
+    assert ok is True
+    assert query.calls == 2
+    assert sleeps == [3.0]
+    assert query.text == "confirmed"
+
+
+@pytest.mark.asyncio
+async def test_coach_checklist_edit_treats_not_modified_as_success():
+    class Query:
+        async def edit_message_text(self, text, reply_markup=None):
+            raise Exception("Message is not modified: specified new message content and reply markup are exactly the same")
+
+    adapter = TelegramAdapter.__new__(TelegramAdapter)
+    adapter.platform = Platform.TELEGRAM
+
+    ok = await TelegramAdapter._safe_coach_checklist_edit(adapter, Query(), "same")
+
+    assert ok is True
