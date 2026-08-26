@@ -592,6 +592,28 @@ class TestWrapperScript:
         assert content.startswith("#!/bin/sh")
         assert "exec /opt/hermes/bin/hermes -p mybot" in content
 
+    def test_policy_managed_profile_wrapper_uses_sandbox_launcher(
+        self, profile_env, monkeypatch
+    ):
+        monkeypatch.setattr("sys.platform", "linux")
+        monkeypatch.setattr(
+            "hermes_cli.profiles.production_profile_launcher_argv",
+            lambda profile: [
+                "/usr/local/sbin/hermes-profile-run",
+                profile,
+                "--",
+            ],
+        )
+        from hermes_cli.profiles import create_wrapper_script
+
+        wrapper = create_wrapper_script("personal-assistant")
+
+        assert wrapper is not None
+        assert wrapper.read_text() == (
+            "#!/bin/sh\n"
+            "exec /usr/local/sbin/hermes-profile-run personal-assistant -- \"$@\"\n"
+        )
+
 
     @pytest.mark.windows_only
     def test_remove_finds_bat_on_windows(self, profile_env):
@@ -1135,5 +1157,3 @@ class TestResolveProfileEnvSpelling:
         # No HERMES_HOME: the platform default root applies (existing contract).
         monkeypatch.delenv("HERMES_HOME", raising=False)
         assert Path(resolve_profile_env("default")) == _get_default_hermes_home()
-
-

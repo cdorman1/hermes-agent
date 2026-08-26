@@ -89,6 +89,57 @@ agent:
         assert required in pinned
 
 
+def test_default_spawn_uses_production_profile_sandbox_launcher(monkeypatch, tmp_path):
+    root = tmp_path / ".hermes"
+    (root / "profiles" / "personal-assistant").mkdir(parents=True)
+    root.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import production_profile_sandbox as sandbox
+
+    captured = {}
+
+    class FakeProc:
+        pid = 4243
+
+    def fake_popen(cmd, *args, **kwargs):
+        captured["cmd"] = list(cmd)
+        captured["cwd"] = kwargs.get("cwd")
+        return FakeProc()
+
+    monkeypatch.setattr(
+        sandbox,
+        "production_profile_launcher_argv",
+        lambda profile, cwd=None: [
+            "/usr/local/sbin/hermes-profile-run",
+            "--cwd",
+            cwd,
+            profile,
+            "--",
+        ],
+    )
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    pid = kb._default_spawn(
+        _make_task(kb, assignee="personal-assistant"),
+        str(workspace),
+    )
+
+    assert pid == 4243
+    assert captured["cmd"][:6] == [
+        "/usr/local/sbin/hermes-profile-run",
+        "--cwd",
+        str(workspace),
+        "personal-assistant",
+        "--",
+        "--cli",
+    ]
+    assert "-p" not in captured["cmd"]
+
+
 def test_default_spawn_model_override_survives_real_cli_parse(monkeypatch, tmp_path):
     """The dispatcher's pre-``chat`` model flag must reach ``args.model``.
 

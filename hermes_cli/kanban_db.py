@@ -10712,7 +10712,7 @@ def _default_spawn(
     *,
     board: Optional[str] = None,
 ) -> Optional[int]:
-    """Fire-and-forget ``hermes -p <profile> chat -q ...`` subprocess.
+    """Fire-and-forget profile worker subprocess.
 
     Returns the spawned child's PID so the dispatcher can detect crashes
     before the claim TTL expires. The child's completion is still observed
@@ -10838,16 +10838,20 @@ def _default_spawn(
     # older hermes builds on PATH that predate the flag's precedence.
     env.pop("HERMES_TUI", None)
 
-    cmd = [
-        *_resolve_hermes_argv(),
-        "-p", profile_arg,
+    from hermes_cli.production_profile_sandbox import production_profile_launcher_argv
+
+    sandbox_cwd = workspace if workspace and os.path.isabs(workspace) and os.path.isdir(workspace) else None
+    cmd = production_profile_launcher_argv(profile_arg, cwd=sandbox_cwd)
+    if cmd is None:
+        cmd = [*_resolve_hermes_argv(), "-p", profile_arg]
+    cmd.extend([
         "--cli",
         # Worker subprocesses switch to a profile-scoped HERMES_HOME above,
         # so they see that profile's shell-hook allowlist instead of the
         # dispatcher's root allowlist. Pass --accept-hooks explicitly so
         # profile-local worker sessions still register configured hooks.
         "--accept-hooks",
-    ]
+    ])
     # Per-task force-loaded skills. Each name goes in its own
     # `--skills X` pair rather than a single comma-joined arg: the CLI
     # accepts both forms (action='append' + comma-split), but
