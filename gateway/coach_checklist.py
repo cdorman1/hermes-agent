@@ -275,7 +275,7 @@ def _load_sessions() -> Dict[str, ChecklistSession]:
     if not path.exists():
         return {}
     try:
-        raw = json.loads(path.read_text())
+        raw = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         logger.warning("Coach checklist session state could not be read; starting empty", exc_info=True)
         return {}
@@ -300,7 +300,14 @@ def _save_sessions(sessions: Dict[str, ChecklistSession]) -> None:
     path = state_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps({sid: s.to_dict() for sid, s in sessions.items()}, indent=2, sort_keys=True))
+    tmp.write_text(
+        json.dumps(
+            {sid: session.to_dict() for sid, session in sessions.items()},
+            indent=2,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
     tmp.replace(path)
 
 
