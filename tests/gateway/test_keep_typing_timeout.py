@@ -31,7 +31,6 @@ from gateway.platforms.base import (
     Platform,
     PlatformConfig,
     SendResult,
-    _typing_indicator_config,
 )
 
 
@@ -39,7 +38,7 @@ class _StubAdapter(BasePlatformAdapter):
     def __init__(self):
         super().__init__(PlatformConfig(enabled=True, token="test"), Platform.TELEGRAM)
 
-    async def connect(self) -> bool:
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
         return True
 
     async def disconnect(self) -> None:
@@ -201,71 +200,37 @@ class TestKeepTypingTimeoutPerTick:
         )
 
     @pytest.mark.asyncio
-    async def test_typing_indicator_can_be_disabled(self, monkeypatch):
-        """Config/env disabled typing must not call platform send_typing."""
-        monkeypatch.setenv("HERMES_TELEGRAM_TYPING_ENABLED", "false")
+    async def test_stop_typing_refresh_blocks_late_cancel_tick(self, monkeypatch):
+        """Final cleanup must not let a cancelled refresh loop send typing again."""
         adapter = _StubAdapter()
-        calls = []
+        late_sends = []
+        stop_calls = []
 
-        async def recording_send_typing(chat_id, metadata=None):
-            calls.append(chat_id)
+        async def send_typing(chat_id, metadata=None):
+            late_sends.append(chat_id)
 
-        monkeypatch.setattr(adapter, "send_typing", recording_send_typing)
+        async def stop_typing(chat_id):
+            stop_calls.append((chat_id, chat_id in adapter._typing_paused))
 
-        await adapter._keep_typing(chat_id="123", interval=0.1)
+        monkeypatch.setattr(adapter, "send_typing", send_typing)
+        monkeypatch.setattr(adapter, "stop_typing", stop_typing)
 
-        assert calls == []
+        async def late_refresh_after_cancel():
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                if "discord-chat" not in adapter._typing_paused:
+                    await adapter.send_typing("discord-chat")
+                raise
 
-    @pytest.mark.asyncio
-    async def test_typing_indicator_max_seconds_caps_long_turns(self, monkeypatch):
-        """A max_seconds cap lets long gateway turns stop refreshing typing."""
-        adapter = _StubAdapter()
-        adapter._typing_max_seconds = 0.35
-        calls = []
+        task = asyncio.create_task(late_refresh_after_cancel())
+        await asyncio.sleep(0)
 
-        async def recording_send_typing(chat_id, metadata=None):
-            calls.append(chat_id)
+        await adapter._stop_typing_refresh("discord-chat", task, timeout=1.0)
 
-        monkeypatch.setattr(adapter, "send_typing", recording_send_typing)
-        adapter.stop_typing = MagicMock(return_value=asyncio.sleep(0))
-
-        await asyncio.wait_for(
-            adapter._keep_typing(chat_id="123", interval=0.1),
-            timeout=1.0,
-        )
-
-        assert 1 <= len(calls) <= 5
-
-    def test_typing_indicator_config_supports_global_and_platform_overrides(self, monkeypatch):
-        """Gateway defaults can be narrowed per platform without impacting others."""
-        import hermes_cli.config as config_mod
-
-        monkeypatch.delenv("HERMES_GATEWAY_TYPING_ENABLED", raising=False)
-        monkeypatch.delenv("HERMES_GATEWAY_TYPING_MAX_SECONDS", raising=False)
-        monkeypatch.delenv("HERMES_TELEGRAM_TYPING_ENABLED", raising=False)
-        monkeypatch.delenv("HERMES_TELEGRAM_TYPING_MAX_SECONDS", raising=False)
-        monkeypatch.setattr(
-            config_mod,
-            "load_config",
-            lambda: {
-                "gateway": {"typing": {"enabled": True, "max_seconds": 60}},
-                "display": {
-                    "platforms": {
-                        "telegram": {"typing": {"enabled": False, "max_seconds": 10}}
-                    }
-                },
-            },
-        )
-
-        enabled, max_seconds = _typing_indicator_config(Platform.TELEGRAM)
-        assert enabled is False
-        assert max_seconds == 10
-
-    def test_typing_indicator_env_override_wins(self, monkeypatch):
-        """Env remains available for operators who need an emergency toggle."""
-        monkeypatch.setenv("HERMES_TELEGRAM_TYPING_ENABLED", "0")
-        monkeypatch.setenv("HERMES_TELEGRAM_TYPING_MAX_SECONDS", "5")
-
-        enabled, max_seconds = _typing_indicator_config(Platform.TELEGRAM)
-        assert enabled is False
-        assert max_seconds == 5
+        assert late_sends == []
+        assert stop_calls == [
+            ("discord-chat", True),
+            ("discord-chat", True),
+        ]
+        assert "discord-chat" not in adapter._typing_paused

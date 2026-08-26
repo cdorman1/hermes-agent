@@ -7,7 +7,7 @@ import pytest
 
 from gateway import coach_checklist as cc
 from gateway.config import Platform
-from gateway.platforms.telegram import TelegramAdapter
+from plugins.platforms.telegram.adapter import TelegramAdapter
 
 
 class User:
@@ -264,7 +264,10 @@ async def test_coach_checklist_edit_retries_telegram_flood_control(monkeypatch):
     async def fake_sleep(seconds):
         sleeps.append(seconds)
 
-    monkeypatch.setattr("gateway.platforms.telegram.asyncio.sleep", fake_sleep)
+    monkeypatch.setattr(
+        "plugins.platforms.telegram.coach_checklist.asyncio.sleep",
+        fake_sleep,
+    )
 
     class Query:
         def __init__(self):
@@ -293,6 +296,35 @@ async def test_coach_checklist_edit_retries_telegram_flood_control(monkeypatch):
     assert query.calls == 2
     assert sleeps == [3.0]
     assert query.text == "confirmed"
+
+
+@pytest.mark.asyncio
+async def test_coach_checklist_edit_rejects_long_inline_throttle(monkeypatch):
+    class RetryAfter(Exception):
+        retry_after = 60
+
+    async def fail_if_slept(_seconds):
+        raise AssertionError("long Telegram throttle must not stall the handler")
+
+    monkeypatch.setattr(
+        "plugins.platforms.telegram.coach_checklist.asyncio.sleep",
+        fail_if_slept,
+    )
+
+    class Query:
+        async def edit_message_text(self, text, reply_markup=None):
+            raise RetryAfter("Flood control exceeded")
+
+    adapter = TelegramAdapter.__new__(TelegramAdapter)
+    adapter.platform = Platform.TELEGRAM
+
+    ok = await TelegramAdapter._safe_coach_checklist_edit(
+        adapter,
+        Query(),
+        "confirmed",
+    )
+
+    assert ok is False
 
 
 @pytest.mark.asyncio

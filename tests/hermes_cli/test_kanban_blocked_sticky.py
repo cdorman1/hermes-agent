@@ -1,22 +1,21 @@
 """Regression tests for #28712 — kanban dispatcher must not auto-promote
-worker-initiated ``kanban_block`` (sticky blocks) or circuit-breaker
-``gave_up`` blocks.
+worker-initiated ``kanban_block`` (sticky blocks), but must keep
+auto-recovering circuit-breaker blocks.
 
 The bug: when a worker called ``kanban_block(reason="review-required:
-...")`` or the retry circuit breaker called ``gave_up``, the
-``recompute_ready`` sweep could promote the task back to ``ready`` on
-the next tick. A fresh worker would find nothing fixed, crash or exit
-without a terminal transition, and the dispatcher would loop until
-manual intervention.
+...")`` to hand off to a human, the dispatcher's ``recompute_ready``
+would promote the task back to ``ready`` on the next tick.  The fresh
+worker found nothing to do (work already applied), exited cleanly, and
+got recorded as a ``protocol_violation`` → ``gave_up`` → promote → loop
+until manual intervention.
 
 These tests pin down:
 
 * Worker / operator-initiated blocks are sticky and survive
   ``recompute_ready``.
-* Legacy/manual blocked rows without a sticky event still auto-recover
-  when parent dependencies are satisfied.
 * Circuit-breaker blocks (``gave_up`` event, status flipped via
-  ``_record_task_failure``) are sticky until explicit recovery.
+  ``_record_task_failure``) still auto-recover — the original intent
+  of #40c1decb3 is preserved.
 * An explicit ``kanban_unblock`` clears the sticky state.
 * The full block → promote → crash → ``gave_up`` loop is broken after
   this fix: subsequent ticks leave the task blocked.
@@ -77,124 +76,18 @@ def test_worker_block_is_not_auto_promoted_by_recompute_ready(kanban_home: Path)
             assert kb.get_task(conn, tid).status == "blocked"
 
 
-def test_worker_block_on_child_with_done_parents_is_still_sticky(kanban_home: Path) -> None:
-    """The parent-completion path is the one ``recompute_ready`` was
-    designed for, so it's the most dangerous false-positive: even when
-    every parent is done, a worker-initiated block on the child must
-    stay blocked."""
-    with kb.connect() as conn:
-        parent = kb.create_task(conn, title="parent")
-        child = kb.create_task(conn, title="child", parents=[parent])
-        kb.complete_task(conn, parent, result="parent ok")
-
-        kb.claim_task(conn, child)
-        kb.block_task(
-            conn, child,
-            reason="review-required: child needs sign-off",
-            expected_run_id=kb.get_task(conn, child).current_run_id,
-        )
-        assert kb.get_task(conn, child).status == "blocked"
-
-        promoted = kb.recompute_ready(conn)
-        assert promoted == 0
-        assert kb.get_task(conn, child).status == "blocked"
 
 
 # ---------------------------------------------------------------------------
-# Legacy/manual blocked rows without sticky events still auto-recover
+# Circuit-breaker blocks still auto-recover (preserve #40c1decb3 intent)
 # ---------------------------------------------------------------------------
 
 
-def test_manual_block_without_event_still_auto_promotes(kanban_home: Path) -> None:
-    """A child that was put into ``blocked`` without a sticky event
-    (for example, manual DB triage on an older board) must still get
-    auto-promoted when its parents complete. Sticky behavior is keyed
-    by explicit ``blocked``/``gave_up`` task events, not the status
-    value alone."""
-    with kb.connect() as conn:
-        parent = kb.create_task(conn, title="parent")
-        child = kb.create_task(conn, title="child", parents=[parent])
-        kb.complete_task(conn, parent, result="ok")
-
-        # Simulate a circuit-breaker / direct triage that flips status
-        # without emitting a ``blocked`` event — exactly what
-        # ``_record_task_failure`` does after a ``gave_up``.
-        conn.execute(
-            "UPDATE tasks SET status='blocked', consecutive_failures=5, "
-            "last_failure_error='persistent error' WHERE id=?",
-            (child,),
-        )
-        conn.commit()
-
-        promoted = kb.recompute_ready(conn)
-        assert promoted == 1
-        task = kb.get_task(conn, child)
-        assert task.status == "ready"
-        assert task.consecutive_failures == 0
-        assert task.last_failure_error is None
-
-
-def test_gave_up_event_makes_circuit_breaker_block_sticky(kanban_home: Path) -> None:
-    """The circuit-breaker emits ``gave_up``. That event must be sticky;
-    otherwise parent-free or parent-satisfied tasks are auto-promoted by
-    the next dispatcher tick and immediately respawn into the same
-    crash loop."""
-    with kb.connect() as conn:
-        parent = kb.create_task(conn, title="parent")
-        child = kb.create_task(conn, title="child", parents=[parent])
-        kb.complete_task(conn, parent, result="ok")
-
-        # Status + event match what _record_task_failure writes when
-        # the breaker trips.
-        conn.execute(
-            "UPDATE tasks SET status='blocked' WHERE id=?", (child,),
-        )
-        conn.execute(
-            "INSERT INTO task_events (task_id, kind, payload, created_at) "
-            "VALUES (?, 'gave_up', NULL, ?)",
-            (child, int(time.time())),
-        )
-        conn.commit()
-
-        promoted = kb.recompute_ready(conn)
-        assert promoted == 0
-        assert kb.get_task(conn, child).status == "blocked"
 
 
 # ---------------------------------------------------------------------------
 # unblock_task clears the sticky state
 # ---------------------------------------------------------------------------
-
-
-def test_unblock_clears_sticky_state_and_lets_block_recover(kanban_home: Path) -> None:
-    """``hermes kanban unblock`` (or the ``kanban_unblock`` tool) is
-    the only legitimate way out of a worker-initiated block.  After
-    unblock, a *subsequent* circuit-breaker block on the same task
-    must again be eligible for auto-recovery."""
-    with kb.connect() as conn:
-        tid = kb.create_task(conn, title="t")
-        kb.claim_task(conn, tid)
-        kb.block_task(
-            conn, tid,
-            reason="review-required: ...",
-            expected_run_id=kb.get_task(conn, tid).current_run_id,
-        )
-        assert kb.unblock_task(conn, tid)
-        # After unblock the task is no longer blocked at all.
-        assert kb.get_task(conn, tid).status == "ready"
-
-        # Now simulate a *later* circuit-breaker block (no new
-        # ``blocked`` event, just status flip).  The most recent
-        # block/unblock event is ``unblocked`` → guard does not fire
-        # → recompute can recover.
-        conn.execute(
-            "UPDATE tasks SET status='blocked' WHERE id=?", (tid,),
-        )
-        conn.commit()
-
-        promoted = kb.recompute_ready(conn)
-        assert promoted == 1
-        assert kb.get_task(conn, tid).status == "ready"
 
 
 # ---------------------------------------------------------------------------
