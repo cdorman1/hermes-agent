@@ -15,13 +15,15 @@ name: Install & Update E2E
 # Triggers:
 #   * every 12 hours, so upstream drift (a new uv, a Node bump, a PyPI change)
 #     surfaces on a schedule rather than in someone's review cycle;
+#   * on main when installer or E2E infrastructure changes, so a repair proves
+#     itself immediately without waiting for the next schedule;
 #   * when a release tag is created -- the moment the set of versions users can
 #     update FROM changes, and the moment a broken updater would strand them;
 #   * manually, where you can pick the route and how many releases to sample.
 #
 # Deliberately NOT on pull_request: a leg takes ~11 minutes of real toolchain
 # installation, and the matrix multiplies that. Updating is release-shaped work,
-# so it is gated on releases and the clock instead.
+# so branch pushes are limited to main and only the files this E2E consumes.
 
 on:
   workflow_dispatch:
@@ -41,10 +43,20 @@ on:
     # Every 12 hours, off the hour to avoid the top-of-hour runner crunch.
     - cron: '20 7,19 * * *'
   push:
+    branches:
+      - main
     tags:
       # Release tags only: the repo also carries backup/* and one-off tags.
       - 'v[0-9]+.[0-9]+.[0-9]+'
       - 'v[0-9]+.[0-9]+.[0-9]+.[0-9]+'
+    paths:
+      - '.github/workflows/install-e2e.yml'
+      - '.github/workflows/install-e2e-run.yml'
+      - 'scripts/dev-sandbox.sh'
+      - 'scripts/sandbox/**'
+      - 'scripts/install.sh'
+      - 'tests/install/**'
+      - 'tests/test_dev_sandbox_worktree_status.py'
 
 permissions:
   contents: read
