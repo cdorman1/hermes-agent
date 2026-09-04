@@ -87,6 +87,24 @@ step() { printf '\n\033[1;36m▶ %s\033[0m\n' "$*"; }
 ok()   { printf '\033[1;32m  ✓ %s\033[0m\n' "$*"; }
 fail() { printf '\n\033[1;31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
 
+# GitHub keeps raw job logs and uploaded artifacts behind authentication even
+# for public repositories.  Surface the already-public installer transcript's
+# tail as a check annotation so an unauthenticated maintainer can diagnose a
+# scheduled failure without exposing environment variables or unrelated logs.
+report_ci_log_tail() {
+  local log="$1"
+  [ "${GITHUB_ACTIONS:-}" = true ] || return 0
+  [ -s "$log" ] || return 0
+
+  local excerpt
+  excerpt="$(sed '/^[[:space:]]*$/d' "$log" | tail -n 30 || true)"
+  [ -n "$excerpt" ] || return 0
+  excerpt="${excerpt//'%'/'%25'}"
+  excerpt="${excerpt//$'\r'/'%0D'}"
+  excerpt="${excerpt//$'\n'/'%0A'}"
+  printf '::error title=Hermes installer failure details::%s\n' "$excerpt" >&2
+}
+
 # The sandbox's internal logs (fake-internet proxy, slirp) explain failures that
 # happen BEFORE install.sh gets to say anything -- a TLS handshake the proxy
 # rejected looks like a bare `curl: (35)` from outside. Copy them out where a CI
@@ -212,6 +230,7 @@ install_in_sandbox() {
   "${SANDBOX[@]}" "${args[@]}" 2>&1 | tee "$log" || status=$?
 
   if [ "$status" -ne 0 ]; then
+    report_ci_log_tail "$log"
     collect_sandbox_logs "$tag"
     fail "$what failed (exit $status)"
   fi
