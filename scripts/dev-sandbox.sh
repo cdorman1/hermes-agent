@@ -196,6 +196,15 @@ COMMIT="$(git -C "$GIT_ROOT" rev-parse --verify 'HEAD^{commit}')" || {
 SANDBOX_DIR_NAME="${HERMES_DEV_SANDBOX_DIR:-.hermes-sandbox}"
 PERSISTENT_ROOT="$GIT_ROOT/$SANDBOX_DIR_NAME"
 
+# A persistent sandbox lives inside the source worktree.  It is runtime state,
+# not a source edit, so it must not make the worktree look dirty when this
+# script is invoked again against the same sandbox.  The literal pathspec keeps
+# custom sandbox names from being interpreted as glob/pathspec magic.
+SANDBOX_EXCLUDE_PATHSPEC=":(top,literal,exclude)$SANDBOX_DIR_NAME"
+worktree_status() {
+  git -C "$GIT_ROOT" status --porcelain -- . "$SANDBOX_EXCLUDE_PATHSPEC"
+}
+
 if [ "$DELETE" = true ]; then
   if [ ! -d "$PERSISTENT_ROOT" ]; then
     echo "[sandbox] nothing to delete at $PERSISTENT_ROOT" >&2
@@ -387,7 +396,7 @@ if [ -n "$INSTALL_REF" ]; then
   git --git-dir="$FAKE_REPO" fetch -q --force "$UPSTREAM_REPO" \
     "$UPSTREAM_COMMIT:refs/heads/main"
 fi
-if [ -n "$(git -C "$GIT_ROOT" status --porcelain)" ]; then
+if [ -n "$(worktree_status)" ]; then
   echo '[sandbox] warning: current folder is dirty; creating a temporary fake commit for main' >&2
   SNAPSHOT_REPO="$(mktemp -d -t hermes-sandbox-snapshot.XXXXXX)"
   git -C "$SNAPSHOT_REPO" init -q
@@ -396,7 +405,7 @@ if [ -n "$(git -C "$GIT_ROOT" status --porcelain)" ]; then
   git -C "$SNAPSHOT_REPO" config user.email 'sandbox@invalid'
   GIT_DIR="$SNAPSHOT_REPO/.git" GIT_WORK_TREE="$GIT_ROOT" git read-tree "$COMMIT"
   GIT_DIR="$SNAPSHOT_REPO/.git" GIT_WORK_TREE="$GIT_ROOT" \
-    git add -A -- .
+    git add -A -- . "$SANDBOX_EXCLUDE_PATHSPEC"
   SNAPSHOT_TREE="$(GIT_DIR="$SNAPSHOT_REPO/.git" git write-tree)"
   SNAPSHOT_PARENT="$COMMIT"
   if EXISTING_MAIN="$(git --git-dir="$FAKE_REPO" rev-parse --verify refs/heads/main 2>/dev/null)"; then
