@@ -83,6 +83,7 @@ def test_reporter_escapes_annotation_data_and_uses_only_last_30_lines(
     assert "line 2%0A" not in result.stderr
     assert result.stderr.endswith("fatal: 100%25 failed%0D\n")
 
+
 @pytest.mark.parametrize(
     "message",
     [
