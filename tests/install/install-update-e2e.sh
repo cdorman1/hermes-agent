@@ -124,6 +124,7 @@ report_transient_retry() {
   printf '::warning title=Transient installer network failure::%s; retrying once from a clean sandbox\n' \
     "$what" >&2
 }
+
 # The sandbox's internal logs (fake-internet proxy, slirp) explain failures that
 # happen BEFORE install.sh gets to say anything -- a TLS handshake the proxy
 # rejected looks like a bare `curl: (35)` from outside. Copy them out where a CI
