@@ -97,8 +97,11 @@ jobs:
     needs: pick-releases
     strategy:
       # One release breaking is worth knowing about even if another already
-      # failed, so let every leg report.
+      # failed, so let every leg report. Keep the real toolchain downloads
+      # bounded: an unbounded matrix can overwhelm GitHub and package CDNs and
+      # turn network throttling into a false release failure.
       fail-fast: false
+      max-parallel: 2
       matrix:
         install-ref: ${{ fromJSON(needs.pick-releases.outputs.tags) }}
     uses: ./.github/workflows/install-e2e-run.yml
@@ -113,7 +116,7 @@ jobs:
     needs: pick-releases
     strategy:
       fail-fast: false
-      max-parallel: 3
+      max-parallel: 2
       matrix:
         install-ref: ${{ fromJSON(needs.pick-releases.outputs.tags) }}
     uses: ./.github/workflows/install-e2e-run.yml
