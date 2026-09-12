@@ -55,6 +55,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
+          fetch-tags: true
 
       # bubblewrap + slirp4netns are what the sandbox is built on; util-linux
       # supplies the `unshare` that builds the multi-uid userns for the
@@ -94,6 +95,10 @@ jobs:
           # copy into a fresh fake-main commit on every invocation, moving the
           # update target mid-run.
           HERMES_E2E_LOG_DIR: ${{ runner.temp }}/e2e-logs
+          # The selected releases came from this checkout. Reuse it as the
+          # sandbox upstream instead of anonymously fetching the same tag from
+          # GitHub in every matrix leg (which repeatedly hit HTTP 429).
+          HERMES_DEV_SANDBOX_UPSTREAM: ${{ github.workspace }}
 
       # Artifact names cannot contain '/', and install-ref may be a full ref
       # like refs/heads/main. GitHub Actions expressions have no string-replace
