@@ -105,6 +105,25 @@ report_ci_log_tail() {
   printf '::error title=Hermes installer failure details::%s\n' "$excerpt" >&2
 }
 
+# A released installer still performs real toolchain downloads, so a CDN or
+# registry can occasionally fail independently of Hermes. Retry only signatures
+# that unambiguously describe transport trouble. Dependency resolution,
+# lockfile errors, missing packages, and generic npm failures remain hard
+# failures on the first attempt.
+is_transient_install_failure() {
+  local log="$1"
+  [ -s "$log" ] || return 1
+  grep -Eiq -- \
+    'HTTP[^[:cntrl:]]*(429|500|502|503|504)|returned error: (429|500|502|503|504)|status( code)?[^0-9]*(429|500|502|503|504)|curl: \((28|52|56)\)|Empty reply from server|connection reset|network timeout|ETIMEDOUT|ECONNRESET|ERR_SOCKET_TIMEOUT|EAI_AGAIN|ENETUNREACH' \
+    "$log"
+}
+
+report_transient_retry() {
+  local what="$1"
+  [ "${GITHUB_ACTIONS:-}" = true ] || return 0
+  printf '::warning title=Transient installer network failure::%s; retrying once from a clean sandbox\n' \
+    "$what" >&2
+}
 # The sandbox's internal logs (fake-internet proxy, slirp) explain failures that
 # happen BEFORE install.sh gets to say anything -- a TLS handshake the proxy
 # rejected looks like a bare `curl: (35)` from outside. Copy them out where a CI
@@ -226,14 +245,26 @@ install_in_sandbox() {
   #
   # `set -o pipefail` is load-bearing here: without it the pipeline reports
   # tee's status and a failed install looks like a pass.
+  local attempt=1
   local status=0
-  "${SANDBOX[@]}" "${args[@]}" 2>&1 | tee "$log" || status=$?
+  while :; do
+    status=0
+    "${SANDBOX[@]}" "${args[@]}" 2>&1 | tee "$log" || status=$?
+    [ "$status" -ne 0 ] || break
 
-  if [ "$status" -ne 0 ]; then
+    if [ "$attempt" -eq 1 ] && is_transient_install_failure "$log"; then
+      collect_sandbox_logs "${tag}-attempt-1"
+      mv "$log" "$LOG_DIR/${tag}-attempt-1.log"
+      report_transient_retry "$what"
+      rm -rf -- "$SANDBOX_ROOT"
+      attempt=2
+      continue
+    fi
+
     report_ci_log_tail "$log"
     collect_sandbox_logs "$tag"
     fail "$what failed (exit $status)"
-  fi
+  done
   grep -q 'Installation Complete' "$log" \
     || { collect_sandbox_logs "$tag"; \
          fail "$what did not report a completed install"; }
